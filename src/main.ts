@@ -51,8 +51,18 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * each fire an HTTP request — so they read this cache and the poll fills it.
 	 */
 	private states = new Map<string, ChannelState>()
-	/** Channels any feedback has asked about, and so worth polling. */
-	private watched = new Set<string>()
+	/**
+	 * Which placed action or feedback is looking at which channel.
+	 *
+	 * Keyed `action:<id>` / `feedback:<id>` (Companion instance ids, namespaced
+	 * so the two kinds cannot collide), valued `project/channel`. The
+	 * set of channels worth polling is derived from this rather than kept as its
+	 * own set, so removing a button — Companion calls `unsubscribe` — releases
+	 * its channel, and a channel nobody points at any more stops being polled.
+	 * The project is part of the key so a `project/channel` address to a second
+	 * project is polled against that project, not the connection's own.
+	 */
+	private owners = new Map<string, string>()
 	private timer: NodeJS.Timeout | undefined
 	private polling = false
 
@@ -90,7 +100,14 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		// The cache belongs to the old server; keeping it would colour buttons
 		// from a machine this connection no longer points at.
 		this.states.clear()
+		// Blank-channel buttons resolved against the old project. Drop every
+		// claim and have Companion re-report what is placed, so each one is
+		// re-resolved against the new config.
+		this.owners.clear()
+		this.defaultChannel = ''
 		await this.connect()
+		this.subscribeActions()
+		this.checkAllFeedbacks()
 	}
 
 	getConfigFields(): SomeCompanionConfigField[] {
@@ -191,24 +208,27 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 */
 	private async poll(): Promise<void> {
 		if (this.polling) return
-		const project = this.config.project?.trim()
-		if (!project) return
 
-		const channels = [...this.watched]
-		if (channels.length === 0) return
+		const keys = [...new Set(this.owners.values())]
+		if (keys.length === 0) return
 
 		this.polling = true
 		try {
 			let reachable = false
-			for (const channel of channels) {
+			for (const key of keys) {
+				// Each key carries its own project, so a feedback addressing
+				// `other/channel` is read from `other` — not from this
+				// connection's configured project.
+				const { project, channel } = splitKey(key)
 				try {
 					const state = await this.api.state(project, channel)
-					this.states.set(`${project}/${channel}`, state)
+					// Released while the request was in flight: do not resurrect it.
+					if (this.isWatched(key)) this.states.set(key, state)
 					reachable = true
 				} catch (error) {
 					// A 404 is a wrong channel name, not a dead server — drop the
 					// stale entry so a feedback stops claiming the graphic is up.
-					this.states.delete(`${project}/${channel}`)
+					this.states.delete(key)
 					if (error instanceof BreezeError && error.status !== 0) reachable = true
 				}
 			}
@@ -226,7 +246,17 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	/** Variables track the connection's default channel — see `variables.ts`. */
 	private publishDefaultVariables(): void {
 		const target = this.resolveChannel('')
-		if (!target) return
+		if (!target) {
+			this.setVariableValues({
+				channel: '',
+				playback_state: 'unknown',
+				playback_step: '',
+				playback_steps: '',
+				sources_connected: '',
+				panels_connected: '',
+			})
+			return
+		}
 
 		const state = this.states.get(`${target.project}/${target.channel}`)
 		this.setVariableValues({
@@ -256,14 +286,14 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			const project = value.slice(0, at).trim()
 			const channel = value.slice(at + 1).trim()
 			if (!project || !channel) return null
-			this.watch(channel, project)
+			this.nominateDefault(project, channel)
 			return { project, channel }
 		}
 
 		if (!fallbackProject) return null
 		const channel = value || this.defaultChannel
 		if (!channel) return null
-		this.watch(channel, fallbackProject)
+		this.nominateDefault(fallbackProject, channel)
 		return { project: fallbackProject, channel }
 	}
 
@@ -277,15 +307,78 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 */
 	private defaultChannel = ''
 
-	private watch(channel: string, project: string): void {
+	/** The first channel in this connection's own project to be named becomes the default. */
+	private nominateDefault(project: string, channel: string): void {
+		if (this.defaultChannel) return
 		if (project !== (this.config.project?.trim() ?? '')) return
-		if (!this.defaultChannel) this.defaultChannel = channel
-		this.watched.add(channel)
+		this.defaultChannel = channel
+	}
+
+	/**
+	 * Record that a placed action or feedback is looking at `raw`, replacing
+	 * whatever it looked at before, and return the resolved target.
+	 *
+	 * Called from action `subscribe` and on every feedback run, so an edited
+	 * channel field — or a variable in it changing value — moves the claim
+	 * rather than adding a second one.
+	 */
+	track(ownerId: string, raw: string | undefined): Target | null {
+		const target = this.resolveChannel(raw)
+		if (!target) {
+			this.untrack(ownerId)
+			return null
+		}
+
+		const key = `${target.project}/${target.channel}`
+		const previous = this.owners.get(ownerId)
+		if (previous === key) return target
+
+		this.owners.set(ownerId, key)
+		if (previous !== undefined) this.release(previous)
+		if (!this.states.has(key)) this.pollNow()
+		return target
+	}
+
+	/** Companion reported the action or feedback removed, disabled or edited. */
+	untrack(ownerId: string): void {
+		const previous = this.owners.get(ownerId)
+		if (previous === undefined) return
+		this.owners.delete(ownerId)
+		this.release(previous)
+	}
+
+	private isWatched(key: string): boolean {
+		for (const owned of this.owners.values()) if (owned === key) return true
+		return false
+	}
+
+	/**
+	 * Forget a channel once nothing points at it: stop polling it and drop its
+	 * cached state. If it was the default, hand the role to the next channel in
+	 * this project that something still watches, so the variables keep
+	 * reporting a channel that is actually on a button.
+	 */
+	private release(key: string): void {
+		if (this.isWatched(key)) return
+		this.states.delete(key)
+
+		const project = this.config.project?.trim() ?? ''
+		if (key !== `${project}/${this.defaultChannel}`) return
+
+		this.defaultChannel = ''
+		for (const owned of this.owners.values()) {
+			const next = splitKey(owned)
+			if (next.project === project) {
+				this.defaultChannel = next.channel
+				break
+			}
+		}
+		this.publishDefaultVariables()
 	}
 
 	/** Cached state for a feedback, or undefined before the first poll lands. */
-	stateFor(rawChannel: string | undefined): ChannelState | undefined {
-		const target = this.resolveChannel(rawChannel)
+	stateFor(ownerId: string, rawChannel: string | undefined): ChannelState | undefined {
+		const target = this.track(ownerId, rawChannel)
 		if (!target) return undefined
 		return this.states.get(`${target.project}/${target.channel}`)
 	}
@@ -316,4 +409,10 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.updateStatus(InstanceStatus.UnknownError, message)
 		this.log('error', `${what}: ${message}`)
 	}
+}
+
+/** Split a `project/channel` key. Project keys cannot contain `/`, so the first one is the seam. */
+function splitKey(key: string): Target {
+	const at = key.indexOf('/')
+	return { project: key.slice(0, at), channel: key.slice(at + 1) }
 }

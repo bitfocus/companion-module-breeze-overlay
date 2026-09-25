@@ -20,7 +20,7 @@ of the project name rather than its full display name.
 |---|---|
 | **Server address** | The machine running Breeze — the address it prints at startup. A hostname is fine. Do not use `localhost` unless Companion is on that same machine |
 | **Port** | `7331` unless `BREEZE_PORT` was changed |
-| **Project URL key** | The short key shown in the editor's app bar and on each portal tile — `rahb-1k3f9`, not the display name |
+| **Project URL key** | The short key shown in the editor's app bar and on each portal tile — `demo-1iixd` for the bundled Breeze Demo, not the display name |
 | **API key** | Only if the server was started with `BREEZE_API_KEY`. Leave blank otherwise |
 | **State poll** | How often to read playback state back, in ms. `1000` is plenty; lower it only if a feedback feels sluggish |
 
@@ -34,12 +34,18 @@ Every action and feedback takes a **channel**. That is a scene's URL key, or —
 scene made of independently triggered elements — the element's **Channel** as set in
 the properties panel.
 
-- Leave it blank to use the first channel this connection saw.
+- Leave it blank to use the connection's default channel — the first one any button
+  named in this connection's project.
 - `project/channel` also works, so one connection can reach a second project without
-  being reconfigured.
+  being reconfigured. Feedbacks on such an address read state from that project, the
+  same as actions send to it.
+
+Only channels that a placed action or feedback points at are polled. Deleting or
+disabling the button releases its channel.
 
 The authoritative list of what a project answers to is
-`http://<host>:7331/api/projects/<project>/channels`. Anything absent from it will 404.
+`http://<host>:7331/api/projects/<project>/channels` — for the Breeze Demo,
+`http://<host>:7331/api/projects/demo-1iixd/channels`. Anything absent from it will 404.
 
 ## Actions
 
@@ -106,7 +112,9 @@ this makes it visible beforehand.
 
 ## Variables
 
-Variables track the connection's **default channel** — the first one any button named.
+Variables track the connection's **default channel** — the first one any button named
+in this connection's project. If every button on that channel is removed, the role
+passes to the next channel in the project that a button still uses.
 Per-channel variables would have to be redefined every time a scene is added in Breeze,
 and a variable that disappears breaks any button referencing it. For a specific
 channel, use a feedback, which takes the channel as an option.

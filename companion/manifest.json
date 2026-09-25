@@ -5,7 +5,7 @@
   "name": "breeze-overlay",
   "shortname": "Breeze",
   "description": "Self-hosted broadcast overlay/graphics server — play, stop and update HTML5 graphics on air",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "license": "MIT",
   "repository": "git+https://github.com/bitfocus/companion-module-breeze-overlay.git",
   "bugs": "https://github.com/bitfocus/companion-module-breeze-overlay/issues",

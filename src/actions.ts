@@ -46,8 +46,10 @@ export function UpdateActions(self: ModuleInstance): void {
 	 * show a perfectly green button for a graphic that never appeared, which is
 	 * the exact confusion this module should be removing.
 	 */
-	const run = async (channel: string, verb: string): Promise<void> => {
-		const target = self.resolveChannel(channel)
+	const run = async (actionId: string, channel: string, verb: string): Promise<void> => {
+		// `track`, not just resolve: a blank-channel action placed before any
+		// default existed resolved to nothing at subscribe time.
+		const target = self.track(actionId, channel)
 		if (!target) {
 			self.log('warn', `No channel given for ${verb}, and no default set in the connection config`)
 			return
@@ -84,31 +86,53 @@ export function UpdateActions(self: ModuleInstance): void {
 		useVariables: true,
 	}
 
+	/*
+	 * Placed actions claim their channel so its state is polled — that is what
+	 * keeps the default-channel variables live for a button with no feedback.
+	 * `unsubscribe` fires when the action is removed, disabled or its channel
+	 * edited, and releases the claim; without it a deleted button's channel
+	 * would be polled for the life of the connection.
+	 */
+	const hooks = {
+		optionsToMonitorForSubscribe: ['channel' as const],
+		subscribe: (action: { id: string; options: { channel: string } }) => {
+			self.track(`action:${action.id}`, action.options.channel)
+		},
+		unsubscribe: (action: { id: string }) => {
+			self.untrack(`action:${action.id}`)
+		},
+	}
+
 	self.setActionDefinitions({
 		play: {
 			name: 'PLAY — roll in, or advance to the next hold',
 			options: [channelOption],
-			callback: async (event) => run(event.options.channel, 'play'),
+			...hooks,
+			callback: async (event) => run(`action:${event.id}`, event.options.channel, 'play'),
 		},
 		next: {
 			name: 'NEXT — advance to the next hold',
 			options: [channelOption],
-			callback: async (event) => run(event.options.channel, 'next'),
+			...hooks,
+			callback: async (event) => run(`action:${event.id}`, event.options.channel, 'next'),
 		},
 		stop: {
 			name: 'STOP — run the outro',
 			options: [channelOption],
-			callback: async (event) => run(event.options.channel, 'stop'),
+			...hooks,
+			callback: async (event) => run(`action:${event.id}`, event.options.channel, 'stop'),
 		},
 		clear: {
 			name: 'CLEAR — hard reset, nothing on screen',
 			options: [channelOption],
-			callback: async (event) => run(event.options.channel, 'clear'),
+			...hooks,
+			callback: async (event) => run(`action:${event.id}`, event.options.channel, 'clear'),
 		},
 		clear_all: {
 			name: 'CLEAR ALL — every element of a scene down at once',
 			options: [channelOption],
-			callback: async (event) => run(event.options.channel, 'clear-all'),
+			...hooks,
+			callback: async (event) => run(`action:${event.id}`, event.options.channel, 'clear-all'),
 		},
 		update: {
 			name: 'Update fields on air',
@@ -123,8 +147,9 @@ export function UpdateActions(self: ModuleInstance): void {
 					multiline: true,
 				},
 			],
+			...hooks,
 			callback: async (event) => {
-				const target = self.resolveChannel(event.options.channel)
+				const target = self.track(`action:${event.id}`, event.options.channel)
 				if (!target) {
 					self.log('warn', 'No channel given for update, and no default set')
 					return

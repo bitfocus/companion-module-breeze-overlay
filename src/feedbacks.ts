@@ -27,6 +27,14 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 		useVariables: true,
 	}
 
+	/*
+	 * Each run re-claims the feedback's channel (so an edited field or a
+	 * changed variable moves the claim), and `unsubscribe` — which since
+	 * module-base 2.0 fires only on delete/disable — releases it, so a removed
+	 * feedback's channel stops being polled.
+	 */
+	const unsubscribe = (feedback: { id: string }) => self.untrack(`feedback:${feedback.id}`)
+
 	self.setFeedbackDefinitions({
 		/**
 		 * On air — anything other than idle or finished.
@@ -43,8 +51,9 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 				color: combineRgb(255, 255, 255),
 			},
 			options: [channelOption],
+			unsubscribe,
 			callback: (feedback) => {
-				const state = self.stateFor(feedback.options.channel)
+				const state = self.stateFor(`feedback:${feedback.id}`, feedback.options.channel)
 				const playback = state?.playback?.state
 				if (!playback) return false
 				return playback !== 'idle' && playback !== 'finished'
@@ -69,8 +78,9 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 					choices: STATES.map((id) => ({ id, label: id })),
 				},
 			],
+			unsubscribe,
 			callback: (feedback) => {
-				const state = self.stateFor(feedback.options.channel)
+				const state = self.stateFor(`feedback:${feedback.id}`, feedback.options.channel)
 				return (state?.playback?.state ?? 'idle') === feedback.options.state
 			},
 		},
@@ -91,8 +101,9 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 				color: combineRgb(255, 255, 255),
 			},
 			options: [channelOption],
+			unsubscribe,
 			callback: (feedback) => {
-				const state = self.stateFor(feedback.options.channel)
+				const state = self.stateFor(`feedback:${feedback.id}`, feedback.options.channel)
 				// Unknown is not the same as zero: before the first poll lands we
 				// have no basis to warn, and a button that flashes a warning on
 				// every Companion restart teaches people to ignore it.
