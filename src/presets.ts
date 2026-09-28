@@ -46,6 +46,13 @@ const idFor = (channel: string, verb: string) => `${channel}__${verb}`
  */
 const buttonText = (name: string, verb: string) => `${name}\n${verb}`
 
+/** A short, stable hash of a name (djb2), for preset ids. */
+function nameHash(name: string): string {
+	let h = 5381
+	for (const ch of name) h = ((h * 33) ^ ch.codePointAt(0)!) >>> 0
+	return h.toString(36)
+}
+
 export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void {
 	const presets: CompanionPresetDefinitions<ModuleSchema> = {}
 	const sections: CompanionPresetSection<ModuleSchema>[] = []
@@ -92,7 +99,7 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 			type: 'simple',
 			name: `${entry.name} — NEXT`,
 			style: { text: buttonText(label, 'NEXT'), size: 'auto', color: WHITE, bgcolor: BLACK },
-			steps: [{ down: [{ actionId: 'next', options: { channel } }], up: [] }],
+			steps: [{ down: [{ actionId: 'next', options: { channel, table: '' } }], up: [] }],
 			feedbacks: [],
 		}
 
@@ -105,6 +112,22 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 		}
 
 		const ids = [idFor(channel, 'play'), idFor(channel, 'next'), idFor(channel, 'stop'), idFor(channel, 'clear')]
+
+		/*
+		 * PREV only where the server has it (0.74+). The presets are rebuilt when
+		 * the server's version changes, so an upgrade brings the button in; an
+		 * older server is not offered one that would be refused on every press.
+		 */
+		if (self.supports('prev') === true) {
+			presets[idFor(channel, 'prev')] = {
+				type: 'simple',
+				name: `${entry.name} — PREV`,
+				style: { text: buttonText(label, 'PREV'), size: 'auto', color: WHITE, bgcolor: BLACK },
+				steps: [{ down: [{ actionId: 'prev', options: { channel, table: '' } }], up: [] }],
+				feedbacks: [],
+			}
+			ids.splice(1, 0, idFor(channel, 'prev'))
+		}
 
 		// CLEAR ALL only where it means something. On a plain scene it is the
 		// same as CLEAR, and a button that duplicates its neighbour invites the
@@ -126,6 +149,105 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 			name: entry.sceneId ? `${entry.name} (element of ${entry.sceneId})` : entry.name,
 			description: `Channel ${channel}`,
 			keywords: [channel, entry.name, entry.ref].filter(Boolean),
+			definitions: ids,
+		})
+	}
+
+	/*
+	 * One BACKUP button per data source that has a backup (Breeze 0.74+).
+	 * Toggles between the backup and automatic, and lights while the backup is
+	 * on air for any reason — an operator's press or the source's own rules —
+	 * because either way the rows on air are not the source's own.
+	 */
+	const backed = self.backedSources()
+	if (backed.length > 0) {
+		const ids: string[] = []
+		for (const source of backed) {
+			const id = `source__${source.def.id}__backup`
+			presets[id] = {
+				type: 'simple',
+				name: `${source.def.name} — BACKUP`,
+				style: { text: buttonText(source.def.name, 'BACKUP'), size: 'auto', color: WHITE, bgcolor: BLACK },
+				steps: [{ down: [{ actionId: 'source_use', options: { source: source.def.id, mode: 'toggle' } }], up: [] }],
+				feedbacks: [
+					{
+						feedbackId: 'source_state',
+						options: { source: source.def.id, state: 'backup' },
+						style: { bgcolor: AMBER, color: WHITE },
+					},
+				],
+			}
+			ids.push(id)
+		}
+		sections.push({
+			id: 'data-sources',
+			name: 'Data sources',
+			description: 'Put a source’s backup on air, and see when it is',
+			keywords: ['backup', 'data', 'source', 'fallback'],
+			definitions: ids,
+		})
+	}
+
+	/*
+	 * One CHECK button per camera list (Breeze 0.74+, Wave 8): checks every
+	 * camera now, and lights red while any camera is down.
+	 */
+	const cameraLists = self.mediaSources()
+	if (cameraLists.length > 0) {
+		const ids: string[] = []
+		for (const source of cameraLists) {
+			const id = `media__${source.def.id.replace(/[^A-Za-z0-9_-]/g, '_')}__check`
+			presets[id] = {
+				type: 'simple',
+				name: `${source.def.name} — CHECK CAMERAS`,
+				style: { text: buttonText(source.def.name, 'CAMERAS'), size: 'auto', color: WHITE, bgcolor: BLACK },
+				steps: [{ down: [{ actionId: 'media_check', options: { source: source.def.id } }], up: [] }],
+				feedbacks: [
+					{
+						feedbackId: 'media_state',
+						options: { source: source.def.id, state: 'down' },
+						style: { bgcolor: RED, color: WHITE },
+					},
+				],
+			}
+			ids.push(id)
+		}
+		sections.push({
+			id: 'camera-lists',
+			name: 'Camera lists',
+			description: 'Check every camera now, and see when one is down',
+			keywords: ['camera', 'media', 'webcam', 'stream', 'frozen'],
+			definitions: ids,
+		})
+	}
+
+	/*
+	 * One toggle per mode the project's rules name (Breeze 0.74+), lit red
+	 * while that mode is on. Rebuilt with the rest at connect, so a mode added
+	 * to a rule appears after the connection is saved again.
+	 */
+	const modes = self.knownModes()
+	if (modes.length > 0) {
+		const ids: string[] = []
+		for (const mode of modes) {
+			// A hash of the exact name keeps ids apart where sanitising would not
+			// ("First.Alert" and "First Alert" both become First_Alert) and, unlike
+			// a position, stays the same when another mode is added.
+			const id = `mode__${mode.replace(/[^A-Za-z0-9_-]/g, '_')}__${nameHash(mode)}`
+			presets[id] = {
+				type: 'simple',
+				name: `Mode — ${mode}`,
+				style: { text: buttonText(mode, 'MODE'), size: 'auto', color: WHITE, bgcolor: BLACK },
+				steps: [{ down: [{ actionId: 'mode', options: { value: mode, how: 'toggle' } }], up: [] }],
+				feedbacks: [{ feedbackId: 'mode_is', options: { mode }, style: { bgcolor: RED, color: WHITE } }],
+			}
+			ids.push(id)
+		}
+		sections.push({
+			id: 'modes',
+			name: 'Modes',
+			description: 'Put the whole project into a mode, and see when it is',
+			keywords: ['mode', 'first alert', 'alert'],
 			definitions: ids,
 		})
 	}

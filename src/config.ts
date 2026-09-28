@@ -76,7 +76,9 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 		{
 			type: 'number',
 			id: 'pollInterval',
-			label: 'State poll (ms)',
+			// Breeze 0.74+ pushes state instead; this is the fallback for older
+			// servers and for a channel whose socket is reconnecting.
+			label: 'State poll (ms) — fallback when not live',
 			width: 4,
 			min: 250,
 			max: 10000,
