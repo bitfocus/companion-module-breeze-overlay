@@ -1,8 +1,6 @@
 // Copyright (C) 2026 Dave Clark
 // SPDX-License-Identifier: MIT
 
-import { InstanceStatus } from '@companion-module/base'
-
 import type { PageTarget, VerbResult } from './api.js'
 import type ModuleInstance from './main.js'
 import { toggleUse } from './sources.js'
@@ -71,11 +69,17 @@ export function UpdateActions(self: ModuleInstance): void {
 	 * was listening, so nothing happened on screen. Companion would otherwise
 	 * show a perfectly green button for a graphic that never appeared, which is
 	 * the exact confusion this module should be removing.
+	 *
+	 * `signal` is Companion's: it aborts when the press is no longer wanted — the
+	 * running actions were cancelled, or the connection is being removed. The
+	 * request stops waiting, and nothing is reported for a press nobody is
+	 * waiting on any more.
 	 */
 	const send = async (
 		actionId: string,
 		channel: string,
 		what: string,
+		signal: AbortSignal,
 		call: (project: string, channel: string) => Promise<VerbResult>,
 		feature?: Feature,
 	): Promise<void> => {
@@ -96,18 +100,21 @@ export function UpdateActions(self: ModuleInstance): void {
 					`${what} ${target.project}/${target.channel} reached no browser sources — is the output open in OBS or vMix?`,
 				)
 			}
-			self.updateStatus(InstanceStatus.Ok)
+			self.commandSucceeded()
 			// The graphic has just changed; do not wait up to a poll interval to
 			// say so on the button. (Live channels are pushed anyway; this only
 			// polls the ones that are not.)
 			self.pollNow()
 		} catch (error) {
+			if (signal.aborted) return
 			self.reportError(`${what} ${target.project}/${target.channel}`, error)
 		}
 	}
 
-	const run = async (actionId: string, channel: string, verb: string): Promise<void> =>
-		send(actionId, channel, verb, async (project, name) => self.api.verb(project, name, verb))
+	const run = async (actionId: string, channel: string, verb: string, signal: AbortSignal): Promise<void> =>
+		send(actionId, channel, verb, signal, async (project, name) =>
+			self.api.verb(project, name, verb, undefined, signal),
+		)
 
 	/*
 	 * `useVariables: true` is all that is needed to support `$(internal:…)` in
@@ -154,13 +161,13 @@ export function UpdateActions(self: ModuleInstance): void {
 			name: 'PLAY — roll in, or advance to the next hold',
 			options: [channelOption],
 			...hooks,
-			callback: async (event) => run(`action:${event.id}`, event.options.channel, 'play'),
+			callback: async (event, context) => run(`action:${event.id}`, event.options.channel, 'play', context.signal),
 		},
 		next: {
 			name: 'NEXT — next page of a paged table while holding, otherwise the next hold',
 			options: [channelOption, tableOption],
 			...hooks,
-			callback: async (event) => {
+			callback: async (event, context) => {
 				const table = event.options.table?.trim() ?? ''
 				// A plain NEXT stays exactly the request every server version
 				// understands; only an aimed one needs 0.74.
@@ -168,7 +175,8 @@ export function UpdateActions(self: ModuleInstance): void {
 					`action:${event.id}`,
 					event.options.channel,
 					table ? `NEXT on table ${table}` : 'next',
-					async (project, channel) => self.api.verb(project, channel, 'next', table || undefined),
+					context.signal,
+					async (project, channel) => self.api.verb(project, channel, 'next', table || undefined, context.signal),
 					table ? 'prev' : undefined,
 				)
 			},
@@ -178,13 +186,14 @@ export function UpdateActions(self: ModuleInstance): void {
 			description: 'Never takes a graphic off air. Needs Breeze 0.74 or later.',
 			options: [channelOption, tableOption],
 			...hooks,
-			callback: async (event) => {
+			callback: async (event, context) => {
 				const table = event.options.table?.trim() ?? ''
 				await send(
 					`action:${event.id}`,
 					event.options.channel,
 					table ? `PREV on table ${table}` : 'prev',
-					async (project, channel) => self.api.verb(project, channel, 'prev', table || undefined),
+					context.signal,
+					async (project, channel) => self.api.verb(project, channel, 'prev', table || undefined, context.signal),
 					'prev',
 				)
 			},
@@ -193,19 +202,19 @@ export function UpdateActions(self: ModuleInstance): void {
 			name: 'STOP — run the outro',
 			options: [channelOption],
 			...hooks,
-			callback: async (event) => run(`action:${event.id}`, event.options.channel, 'stop'),
+			callback: async (event, context) => run(`action:${event.id}`, event.options.channel, 'stop', context.signal),
 		},
 		clear: {
 			name: 'CLEAR — hard reset, nothing on screen',
 			options: [channelOption],
 			...hooks,
-			callback: async (event) => run(`action:${event.id}`, event.options.channel, 'clear'),
+			callback: async (event, context) => run(`action:${event.id}`, event.options.channel, 'clear', context.signal),
 		},
 		clear_all: {
 			name: 'CLEAR ALL — every element of a scene down at once',
 			options: [channelOption],
 			...hooks,
-			callback: async (event) => run(`action:${event.id}`, event.options.channel, 'clear-all'),
+			callback: async (event, context) => run(`action:${event.id}`, event.options.channel, 'clear-all', context.signal),
 		},
 		update: {
 			name: 'Update fields on air',
@@ -221,7 +230,7 @@ export function UpdateActions(self: ModuleInstance): void {
 				},
 			],
 			...hooks,
-			callback: async (event) => {
+			callback: async (event, context) => {
 				const fields = parseFields(event.options.fields)
 				if (Object.keys(fields).length === 0) {
 					// Still claim the channel, so the variables follow this button.
@@ -229,8 +238,8 @@ export function UpdateActions(self: ModuleInstance): void {
 					self.log('warn', 'Update had no name=value lines, so nothing was sent')
 					return
 				}
-				await send(`action:${event.id}`, event.options.channel, 'update', async (project, channel) =>
-					self.api.update(project, channel, fields),
+				await send(`action:${event.id}`, event.options.channel, 'update', context.signal, async (project, channel) =>
+					self.api.update(project, channel, fields, context.signal),
 				)
 			},
 		},
@@ -271,7 +280,7 @@ export function UpdateActions(self: ModuleInstance): void {
 				},
 			],
 			...hooks,
-			callback: async (event) => {
+			callback: async (event, context) => {
 				const target = pageTarget(event.options.by, event.options.page ?? '')
 				if (typeof target === 'string') {
 					self.track(`action:${event.id}`, event.options.channel)
@@ -284,7 +293,8 @@ export function UpdateActions(self: ModuleInstance): void {
 					`action:${event.id}`,
 					event.options.channel,
 					`Go to ${label}`,
-					async (project, channel) => self.api.page(project, channel, target, table),
+					context.signal,
+					async (project, channel) => self.api.page(project, channel, target, table, context.signal),
 					'page',
 				)
 			},
@@ -313,10 +323,11 @@ export function UpdateActions(self: ModuleInstance): void {
 						{ id: 'hold', label: 'Hold — stay on this page' },
 						{ id: 'resume', label: 'Resume — carry on from this page' },
 					],
+					disableAutoExpression: true,
 				},
 			],
 			...hooks,
-			callback: async (event) => {
+			callback: async (event, context) => {
 				const table = event.options.table?.trim() || undefined
 				let state: 'hold' | 'resume' = event.options.state === 'resume' ? 'resume' : 'hold'
 
@@ -331,7 +342,8 @@ export function UpdateActions(self: ModuleInstance): void {
 					`action:${event.id}`,
 					event.options.channel,
 					`Cycle ${state}${table ? ` on table ${table}` : ''}`,
-					async (project, channel) => self.api.cycle(project, channel, state, table),
+					context.signal,
+					async (project, channel) => self.api.cycle(project, channel, state, table, context.signal),
 					'cycle',
 				)
 			},
@@ -370,7 +382,7 @@ export function UpdateActions(self: ModuleInstance): void {
 					disableAutoExpression: true,
 				},
 			],
-			callback: async (event) => {
+			callback: async (event, context) => {
 				const project = self.config.project?.trim() ?? ''
 				const source = event.options.source?.trim() ?? ''
 				if (!project || !source) {
@@ -385,10 +397,11 @@ export function UpdateActions(self: ModuleInstance): void {
 							? event.options.mode
 							: 'auto'
 				try {
-					await self.api.useSource(project, source, mode)
-					self.updateStatus(InstanceStatus.Ok)
+					await self.api.useSource(project, source, mode, context.signal)
+					self.commandSucceeded()
 					self.pollSourcesNow()
 				} catch (error) {
+					if (context.signal.aborted) return
 					self.reportError(`Data source ${source} → ${mode}`, error)
 				}
 			},
@@ -410,7 +423,7 @@ export function UpdateActions(self: ModuleInstance): void {
 					useVariables: true,
 				},
 			],
-			callback: async (event) => {
+			callback: async (event, context) => {
 				const project = self.config.project?.trim() ?? ''
 				const source = event.options.source?.trim() ?? ''
 				if (!project || !source) {
@@ -419,10 +432,11 @@ export function UpdateActions(self: ModuleInstance): void {
 				}
 				if (!self.requireFeature('media', 'Camera check')) return
 				try {
-					await self.api.checkMedia(project, source)
-					self.updateStatus(InstanceStatus.Ok)
+					await self.api.checkMedia(project, source, context.signal)
+					self.commandSucceeded()
 					self.pollSourcesNow()
 				} catch (error) {
+					if (context.signal.aborted) return
 					self.reportError(`Camera check ${source}`, error)
 				}
 			},
@@ -458,7 +472,7 @@ export function UpdateActions(self: ModuleInstance): void {
 					disableAutoExpression: true,
 				},
 			],
-			callback: async (event) => {
+			callback: async (event, context) => {
 				const project = self.config.project?.trim() ?? ''
 				if (!project) {
 					self.log('warn', 'Mode: no project in the connection config, so nothing was sent')
@@ -474,10 +488,11 @@ export function UpdateActions(self: ModuleInstance): void {
 							? ''
 							: wanted
 				try {
-					const result = await self.api.setMode(project, value)
+					const result = await self.api.setMode(project, value, context.signal)
 					self.noteMode(result.mode)
-					self.updateStatus(InstanceStatus.Ok)
+					self.commandSucceeded()
 				} catch (error) {
+					if (context.signal.aborted) return
 					self.reportError(`Mode → ${value || '(none)'}`, error)
 				}
 			},

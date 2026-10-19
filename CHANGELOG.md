@@ -4,6 +4,17 @@ All notable changes to the Breeze Overlay module for Bitfocus Companion are docu
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each release is tagged `vX.Y.Z` and submitted through the Bitfocus developer portal. Features marked **0.74+** need Breeze Overlay 0.74.0 or later; against an older server they log _"needs Breeze 0.74 or later"_ and send nothing.
 
+## [1.1.1]
+
+### Added
+
+- **PAGE** preset (**0.77+**) for every table a graphic was built to page: a status button showing the page on screen out of how many (`2/2`) with the page's key under it (`Peoria Pioneers`). Pressing it does nothing. Offered only for graphics Breeze lists with a paged table, and each button watches its own graphic, not the connection's default channel.
+- **Table page** value feedback (**0.74+**) — the page number, page count, both (`2/3`), or the page key — for showing a page in a button's text through a local variable.
+
+### Changed
+
+- Runs on Node 26 (`runtime.type: node26`), following the current Bitfocus module template. Still needs Companion 5.0 or later, as 1.1.0 did.
+
 ## [1.1.0] - 2026-09-28
 
 > Live state and table paging, data sources, project modes and camera lists, for Breeze Overlay 0.74.

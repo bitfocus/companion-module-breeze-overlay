@@ -4,7 +4,7 @@
 import { combineRgb } from '@companion-module/base'
 import type ModuleInstance from './main.js'
 import { mediaDown, overridden, sourceState } from './sources.js'
-import { findTable, showsPage } from './tables.js'
+import { findTable, pageText, showsPage } from './tables.js'
 
 export type FeedbacksSchema = {
 	on_air: { type: 'boolean'; options: { channel: string } }
@@ -12,6 +12,7 @@ export type FeedbacksSchema = {
 	source_connected: { type: 'boolean'; options: { channel: string } }
 	cycle_held: { type: 'boolean'; options: { channel: string; table: string } }
 	page_is: { type: 'boolean'; options: { channel: string; table: string; by: string; page: string } }
+	table_page: { type: 'value'; options: { channel: string; table: string; show: string } }
 	source_state: { type: 'boolean'; options: { source: string; state: string } }
 	media_state: { type: 'boolean'; options: { source: string; state: string } }
 	mode_is: { type: 'boolean'; options: { mode: string } }
@@ -91,6 +92,7 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 					label: 'State',
 					default: 'holding',
 					choices: STATES.map((id) => ({ id, label: id })),
+					disableAutoExpression: true,
 				},
 			],
 			unsubscribe,
@@ -201,6 +203,40 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 		 * in. Reads the project's source list, polled every few seconds — not a
 		 * channel, so it takes no Channel field.
 		 */
+		/*
+		 * A value, not a style: what a PAGE status button prints. Each button
+		 * stores it in a local variable (`$(local:page)`), so every button can
+		 * watch its own graphic's table — the connection variables only follow
+		 * the default channel.
+		 */
+		table_page: {
+			name: 'Table page — page number, count or key (Breeze 0.74+)',
+			type: 'value',
+			options: [
+				channelOption,
+				tableOption,
+				{
+					id: 'show',
+					type: 'dropdown',
+					label: 'Show',
+					default: 'page',
+					choices: [
+						{ id: 'page', label: 'Page of pages — 2/3' },
+						{ id: 'number', label: 'Page number — 2' },
+						{ id: 'count', label: 'Page count — 3' },
+						{ id: 'key', label: 'Page key — e.g. Group C' },
+					],
+					disableAutoExpression: true,
+				},
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const state = self.stateFor(`feedback:${feedback.id}`, feedback.options.channel)
+				const table = findTable(state?.playback?.tables, feedback.options.table)[0]
+				return table ? pageText(table, feedback.options.show) : ''
+			},
+		},
+
 		source_state: {
 			name: 'Data source is… (Breeze 0.74+)',
 			type: 'boolean',

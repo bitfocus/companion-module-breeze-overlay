@@ -28,6 +28,8 @@ export const MIN_VERSION = {
 	mode: '0.74.0',
 	/** Camera lists: media checks per source, and checking them now (Wave 8). */
 	media: '0.74.0',
+	/** `GET /api/auth`: whether the server needs a key, read at connect. */
+	auth: '0.74.0',
 } as const
 
 export type Feature = keyof typeof MIN_VERSION

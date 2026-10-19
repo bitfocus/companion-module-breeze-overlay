@@ -21,6 +21,7 @@
  */
 
 import type { ChannelState } from './api.js'
+import { toChannelState } from './validate.js'
 
 export const hasWebSocket = typeof globalThis.WebSocket === 'function'
 
@@ -35,10 +36,17 @@ export interface LiveChannelEvents {
 
 const FIRST_RETRY_MS = 1000
 const MAX_RETRY_MS = 10_000
+/**
+ * How long a socket may take to open and be welcomed. Longer than any real hub
+ * needs; past it, whatever answered is not one — a proxy holding the upgrade
+ * open, something else on the port — so drop it and retry on the backoff.
+ */
+const WELCOME_MS = 10_000
 
 export class LiveChannel {
 	private socket: WebSocket | undefined
 	private retry: NodeJS.Timeout | undefined
+	private welcome: NodeJS.Timeout | undefined
 	private delay = FIRST_RETRY_MS
 	private stopped = true
 
@@ -72,7 +80,11 @@ export class LiveChannel {
 		this.drop()
 	}
 
-	/** Drop the socket and dial again at once — used when the watchdog loses the server. */
+	/**
+	 * Drop the socket and dial again after the current backoff — used when the
+	 * watchdog loses the server. Not at once: the server has just stopped
+	 * answering, and the first redial is already a second away.
+	 */
 	restart(): void {
 		if (this.stopped) return
 		const wasLive = this.live
@@ -82,6 +94,8 @@ export class LiveChannel {
 	}
 
 	private drop(): void {
+		if (this.welcome) clearTimeout(this.welcome)
+		this.welcome = undefined
 		const socket = this.socket
 		this.socket = undefined
 		this.live = false
@@ -107,6 +121,15 @@ export class LiveChannel {
 		}
 		this.socket = socket
 
+		// A socket that never gets a welcome is never live and would otherwise
+		// sit open forever, never retried; the poll covers the channel meanwhile.
+		this.welcome = setTimeout(() => {
+			this.welcome = undefined
+			if (this.socket !== socket || this.live) return
+			this.drop()
+			this.scheduleRetry()
+		}, WELCOME_MS)
+
 		socket.onopen = () => {
 			socket.send(
 				JSON.stringify({
@@ -130,6 +153,8 @@ export class LiveChannel {
 			if (!state) return
 			if (!this.live) {
 				this.live = true
+				if (this.welcome) clearTimeout(this.welcome)
+				this.welcome = undefined
 				this.delay = FIRST_RETRY_MS
 				this.events.open(this.key)
 			}
@@ -141,6 +166,8 @@ export class LiveChannel {
 
 		socket.onclose = () => {
 			if (this.socket !== socket) return
+			if (this.welcome) clearTimeout(this.welcome)
+			this.welcome = undefined
 			const wasLive = this.live
 			this.socket = undefined
 			this.live = false
@@ -161,11 +188,10 @@ export class LiveChannel {
 	}
 }
 
-/** The state carried by a `welcome` or `state` message, or null for anything else. */
+/** The state carried by a `welcome` or `state` message, checked; null for anything else. */
 function stateOf(message: unknown): ChannelState | null {
 	if (typeof message !== 'object' || message === null) return null
 	const { type, state } = message as { type?: unknown; state?: unknown }
 	if (type !== 'welcome' && type !== 'state') return null
-	if (typeof state !== 'object' || state === null) return null
-	return state as ChannelState
+	return toChannelState(state)
 }

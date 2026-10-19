@@ -29,7 +29,7 @@ import { UpdateFeedbacks, type FeedbacksSchema } from './feedbacks.js'
 import { LiveChannel, hasWebSocket } from './live.js'
 import { BuildPresets } from './presets.js'
 import { mediaDown, mediaUp, sourceState } from './sources.js'
-import { cycleState } from './tables.js'
+import { cycleState, pageNumber } from './tables.js'
 import { UpdateVariableDefinitions, type VariablesSchema } from './variables.js'
 import { UpgradeScripts } from './upgrades.js'
 import { MIN_VERSION, atLeast, type Feature } from './versions.js'
@@ -51,7 +51,7 @@ interface Target {
 }
 
 /** Every feedback reads the same cache, so every change re-checks them all. */
-const ALL_FEEDBACKS = ['on_air', 'playback_state', 'source_connected', 'cycle_held', 'page_is'] as const
+const ALL_FEEDBACKS = ['on_air', 'playback_state', 'source_connected', 'cycle_held', 'page_is', 'table_page'] as const
 
 /** How often to prove the server is still there while every channel is live. */
 const WATCHDOG_MS = 5000
@@ -101,7 +101,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	private sockets = new Map<string, LiveChannel>()
 
 	private timer: NodeJS.Timeout | undefined
-	private polling = false
+	/** The connect generation of the poll round in flight, if any — see `poll`. */
+	private pollingGeneration: number | undefined
 	private watchdog: NodeJS.Timeout | undefined
 	private refreshQueued: NodeJS.Timeout | undefined
 	private ticker: NodeJS.Timeout | undefined
@@ -120,10 +121,36 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 */
 	private sourcesGeneration = 0
 
+	/**
+	 * Bumped by every `connect()` and by `destroy()`.
+	 *
+	 * Connecting, polling and version checks all wait on the network, and the
+	 * config — or the instance itself — can change while they wait: an operator
+	 * saving twice while correcting a host, or removing the connection. Each
+	 * captures this before its first `await` and drops its result if it moved,
+	 * so an answer from the old server cannot set the status, the version gate
+	 * or a timer for the new one, and nothing restarts after `destroy()`.
+	 */
+	private generation = 0
+	private destroyed = false
+
 	/** As `/healthz` last reported it; empty until the server has answered once. */
 	serverVersion = ''
 	/** Null until the first answer, so the first success is not taken for a recovery. */
 	private reachable: boolean | null = null
+	/**
+	 * Why the server is refusing this connection's key, or undefined while
+	 * there is no reason to think it is.
+	 *
+	 * Breeze checks the key only on commands — every read is open — so a wrong
+	 * key cannot show up in a poll, and probing for one would spend one of the
+	 * five wrong keys a minute Breeze allows this machine. It is set by a
+	 * refused command, or at connect when the server needs a key and none is
+	 * configured. While it is set, the status stays AuthenticationFailure
+	 * through every poll and socket message, until a command succeeds or the
+	 * config is saved.
+	 */
+	private keyProblem: string | undefined
 
 	async init(config: ModuleConfig, _isFirstInit: boolean, secrets: ModuleSecrets): Promise<void> {
 		this.config = config
@@ -146,14 +173,30 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			state_source: '',
 			sources_failing: '',
 			sources_on_backup: '',
+			media_up: '',
+			media_down: '',
 			mode: '',
 			...EMPTY_TABLE_VARIABLES,
 		})
 
-		await this.connect()
+		/*
+		 * Not awaited. Companion allows `init` ten seconds and then restarts the
+		 * module, and connect() makes up to four requests of up to five seconds
+		 * each: a slow server would put the module in a restart loop. The status
+		 * says Connecting meanwhile, and connect() reports its own failures.
+		 */
+		this.startConnect()
+	}
+
+	/** Connect in the background — see `init`. Every failure inside is already reported. */
+	private startConnect(): void {
+		this.connect().catch((error: unknown) => this.reportError('connect', error))
 	}
 
 	async destroy(): Promise<void> {
+		this.destroyed = true
+		this.generation += 1
+		this.sourcesGeneration += 1
 		this.stopPolling()
 		this.stopSourcePolling()
 		this.stopSockets()
@@ -177,15 +220,21 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.sourcesSignature = ''
 		this.sourcesGeneration += 1
 		this.sourcesInflight = undefined
-		this.setVariableValues({ sources_failing: '', sources_on_backup: '', mode: '' })
+		this.setVariableValues({ sources_failing: '', sources_on_backup: '', media_up: '', media_down: '', mode: '' })
 		this.serverVersion = ''
 		this.reachable = null
+		// The key may be the thing that was just fixed.
+		this.keyProblem = undefined
 		// Blank-channel buttons resolved against the old project. Drop every
 		// claim and have Companion re-report what is placed, so each one is
 		// re-resolved against the new config.
 		this.owners.clear()
 		this.defaultChannel = ''
-		await this.connect()
+		// In the background, for the same reason as in init(): Companion gives
+		// configUpdated five seconds. Its synchronous start has already moved the
+		// connect generation on, so the re-subscriptions below poll the new
+		// server, and anything still running against the old one is ignored.
+		this.startConnect()
 		this.subscribeActions()
 		this.checkAllFeedbacks()
 	}
@@ -212,16 +261,24 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * server will understand.
 	 */
 	private async connect(): Promise<void> {
+		const generation = ++this.generation
 		this.stopPolling()
-		this.updateStatus(InstanceStatus.Connecting)
+		this.setStatus(InstanceStatus.Connecting)
 
 		try {
 			const health = await this.api.health()
+			// A newer connect() or destroy() ran while this one waited; it owns
+			// the status, the version and the timers now.
+			if (!this.isCurrent(generation)) return
 			this.applyVersion(health.version, false)
-			await this.refreshPresets()
+			await this.refreshPresets(generation)
+			if (!this.isCurrent(generation)) return
+			await this.checkKeyRequired(generation)
+			if (!this.isCurrent(generation)) return
 			this.reachable = true
-			this.updateStatus(InstanceStatus.Ok)
+			this.showStatus()
 		} catch (error) {
+			if (!this.isCurrent(generation)) return
 			this.reachable = false
 			this.reportError('connect', error)
 			// Still poll: the server may simply not be up yet, and a connection
@@ -232,6 +289,60 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.syncSockets()
 		this.startPolling()
 		this.startSourcePolling()
+	}
+
+	/**
+	 * Catch a missing key before the first press: `GET /api/auth` says whether
+	 * the server needs one, and never counts as an attempt. Whether a key that
+	 * *is* configured is the right one only a command can tell — see
+	 * `keyProblem`. Older servers have no such route; nothing is lost.
+	 */
+	private async checkKeyRequired(generation: number): Promise<void> {
+		if (this.supports('auth') !== true || this.secrets.apiKey) return
+		try {
+			const { keyRequired } = await this.api.auth()
+			if (!this.isCurrent(generation) || !keyRequired) return
+			this.keyProblem = 'This server needs an API key'
+			this.log(
+				'error',
+				'The server has BREEZE_API_KEY set and this connection has no API key — every command will be refused',
+			)
+		} catch {
+			// Only a hint: whether the server is there was decided by /healthz.
+		}
+	}
+
+	/** The status last sent to Companion, so an unchanged one is not sent again every tick. */
+	private statusShown: string | undefined
+
+	/** `updateStatus`, only when the status or its message actually changes. */
+	private setStatus(status: InstanceStatus, message?: string): void {
+		const next = JSON.stringify([status, message ?? null])
+		if (next === this.statusShown) return
+		this.statusShown = next
+		this.updateStatus(status, message)
+	}
+
+	/** Ok, unless the server has refused the key — reachable and refusing is still a failure. */
+	private showStatus(): void {
+		if (this.keyProblem) this.setStatus(InstanceStatus.AuthenticationFailure, this.keyProblem)
+		else this.setStatus(InstanceStatus.Ok)
+	}
+
+	/**
+	 * A command went through, so the key — if one is needed — is right. The
+	 * only proof there is: reads succeed with any key.
+	 */
+	commandSucceeded(): void {
+		if (this.destroyed) return
+		if (this.keyProblem) this.log('info', 'API key accepted')
+		this.keyProblem = undefined
+		this.setStatus(InstanceStatus.Ok)
+	}
+
+	/** Whether async work started under `generation` may still act on its result. */
+	private isCurrent(generation: number): boolean {
+		return !this.destroyed && generation === this.generation
 	}
 
 	/* ------------------------------------------------------------- sources */
@@ -262,6 +373,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * the connection.
 	 */
 	private async pollSources(): Promise<void> {
+		if (this.destroyed) return
 		if (!this.sourcesInflight) {
 			const generation = this.sourcesGeneration
 			this.sourcesInflight = this.readSources(generation).finally(() => {
@@ -386,7 +498,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	}
 
 	private applyVersion(version: string, rebuildPresets: boolean): void {
-		if (version === this.serverVersion) return
+		if (this.destroyed || version === this.serverVersion) return
 		const before = this.serverVersion
 		this.serverVersion = version
 		this.setVariableValues({ server_version: version })
@@ -398,8 +510,10 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	/** Re-read the version after the server comes back — it may have been upgraded while away. */
 	private async recheckVersion(): Promise<void> {
+		const generation = this.generation
 		try {
 			const health = await this.api.health()
+			if (!this.isCurrent(generation)) return
 			this.applyVersion(health.version, true)
 		} catch {
 			// The poll or the watchdog reports the outage; nothing to add here.
@@ -414,7 +528,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * churn the UI for no gain. Reconnecting — or hitting Save on the
 	 * connection — is the natural moment to pick up a newly added scene.
 	 */
-	private async refreshPresets(): Promise<void> {
+	private async refreshPresets(generation = this.generation): Promise<void> {
 		const project = this.config.project?.trim()
 		if (!project) {
 			// Nothing to scope to. Empty rather than every project on the server:
@@ -426,8 +540,10 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 		try {
 			const all = await this.api.allChannels()
+			if (!this.isCurrent(generation)) return
 			// Read before the presets, so a source with a backup gets its button.
 			if (this.supports('sources') === true) await this.pollSources()
+			if (!this.isCurrent(generation)) return
 			const mine = all.find((p) => p.id === project)
 			if (!mine) {
 				this.log('warn', `Project "${project}" not found on the server — no presets generated`)
@@ -437,6 +553,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			BuildPresets(this, mine.channels)
 			this.log('debug', `Built presets for ${mine.channels.length} channels in ${mine.name}`)
 		} catch (error) {
+			if (!this.isCurrent(generation)) return
 			// Presets are a convenience; failing to build them must not stop the
 			// connection from working.
 			this.log('warn', `Could not build presets: ${error instanceof Error ? error.message : String(error)}`)
@@ -451,6 +568,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	/** Open a socket for every watched channel, close the rest. */
 	private syncSockets(): void {
+		if (this.destroyed) return
 		const wanted = this.liveEnabled() ? new Set(this.owners.values()) : new Set<string>()
 
 		for (const [key, socket] of this.sockets) {
@@ -506,7 +624,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * a reconnect like any other.
 	 */
 	private startWatchdog(): void {
-		if (this.watchdog) return
+		if (this.watchdog || this.destroyed) return
 		this.watchdog = setInterval(() => void this.checkServer(), WATCHDOG_MS)
 	}
 
@@ -517,10 +635,13 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	private async checkServer(): Promise<void> {
 		if (![...this.sockets.values()].some((socket) => socket.live)) return
+		const generation = this.generation
 		try {
 			const health = await this.api.health()
+			if (!this.isCurrent(generation)) return
 			this.applyVersion(health.version, true)
 		} catch (error) {
+			if (!this.isCurrent(generation)) return
 			if (error instanceof BreezeError && error.status !== 0) return
 			for (const socket of this.sockets.values()) socket.restart()
 			this.markReachable(false)
@@ -537,6 +658,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	/* ------------------------------------------------------------- polling */
 
 	private startPolling(): void {
+		// Never two at once: a handle overwritten here could not be cleared again.
+		this.stopPolling()
 		const interval = Math.max(250, this.config.pollInterval ?? 1000)
 		this.timer = setInterval(() => void this.poll(), interval)
 		void this.poll()
@@ -553,21 +676,51 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	}
 
 	/**
-	 * Refresh every watched channel that has no live socket.
+	 * Refresh every watched channel that has no live socket — or, with none to
+	 * read and nothing live, just ask `/healthz`, so the status still follows
+	 * the server.
 	 *
 	 * Guarded against overlap: a server that has gone away leaves each request
 	 * to time out, and without this the intervals would stack up requests faster
-	 * than they drain.
+	 * than they drain. The guard is per connect generation, so a slow round
+	 * against the old server neither blocks the new one nor reports for it.
 	 */
 	private async poll(): Promise<void> {
-		if (this.polling) return
+		if (this.destroyed || this.pollingGeneration === this.generation) return
 
 		const keys = [...new Set(this.owners.values())].filter((key) => !this.isLive(key))
-		if (keys.length === 0) return
+		const anyLive = [...this.sockets.values()].some((socket) => socket.live)
+		// Every watched channel is live: the sockets and the watchdog report for it.
+		if (keys.length === 0 && anyLive) return
 
-		this.polling = true
+		const generation = this.generation
+		this.pollingGeneration = generation
 		try {
-			let reachable = [...this.sockets.values()].some((socket) => socket.live)
+			if (keys.length === 0) {
+				/*
+				 * No channel to read, but the status must still follow the
+				 * server. Without this a connection whose buttons only use
+				 * sources, the mode or camera lists — or that has no buttons
+				 * yet — never noticed an outage, and never recovered from a
+				 * failed connect: Companion started before Breeze stayed
+				 * ConnectionFailure, with no presets, until someone saved the
+				 * config. `/healthz` is open and cheap; a recovery re-reads the
+				 * version, which also builds the presets (`markReachable`).
+				 */
+				let reachable: boolean
+				try {
+					await this.api.health()
+					reachable = true
+				} catch (error) {
+					reachable = error instanceof BreezeError && error.status !== 0
+				}
+				if (!this.isCurrent(generation)) return
+				this.markReachable(reachable)
+				return
+			}
+
+			let reachable = anyLive
+			let changed = false
 			for (const key of keys) {
 				// Each key carries its own project, so a feedback addressing
 				// `other/channel` is read from `other` — not from this
@@ -575,31 +728,36 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 				const { project, channel } = splitKey(key)
 				try {
 					const state = await this.api.state(project, channel)
+					if (!this.isCurrent(generation)) return
 					// Released while the request was in flight — or taken over by
 					// a socket — so do not overwrite it.
-					if (this.isWatched(key) && !this.isLive(key)) this.acceptState(key, state, true)
+					if (this.isWatched(key) && !this.isLive(key)) changed = this.acceptState(key, state, true) || changed
 					reachable = true
 				} catch (error) {
+					if (!this.isCurrent(generation)) return
 					// A 404 is a wrong channel name, not a dead server — drop the
 					// stale entry so a feedback stops claiming the graphic is up.
-					this.states.delete(key)
+					if (this.states.delete(key)) changed = true
 					this.tableStamps.delete(key)
 					if (error instanceof BreezeError && error.status !== 0) reachable = true
 				}
 			}
 
 			this.markReachable(reachable)
-			this.refresh()
+			// Only when something a button or variable shows has changed, or the
+			// default channel has moved — not on every tick of an idle show.
+			if (changed || this.defaultKey() !== this.publishedDefault) this.refresh()
 		} finally {
-			this.polling = false
+			if (this.pollingGeneration === generation) this.pollingGeneration = undefined
 		}
 	}
 
 	private markReachable(ok: boolean): void {
+		if (this.destroyed) return
 		const recovered = ok && this.reachable === false
 		this.reachable = ok
-		if (ok) this.updateStatus(InstanceStatus.Ok)
-		else this.updateStatus(InstanceStatus.ConnectionFailure, `No response from ${this.api.base}`)
+		if (ok) this.showStatus()
+		else this.setStatus(InstanceStatus.ConnectionFailure, `No response from ${this.api.base}`)
 		// Came back: it may be a different build now. The sockets follow from
 		// whatever version it reports.
 		if (recovered) void this.recheckVersion()
@@ -615,7 +773,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * a hold together — so those are coalesced into one variable and feedback
 	 * pass instead of one each.
 	 */
-	private acceptState(key: string, state: ChannelState, immediate = false): void {
+	private acceptState(key: string, state: ChannelState, immediate = false): boolean {
+		const before = this.states.get(key)
 		this.states.set(key, state)
 
 		const signature = JSON.stringify(state.playback?.tables ?? null)
@@ -623,11 +782,22 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.tableStamps.set(key, { signature, at: Date.now() })
 		}
 
-		if (!immediate) this.queueRefresh()
+		const changed = before === undefined || shownOf(before) !== shownOf(state)
+		if (changed && !immediate) this.queueRefresh()
+		return changed
 	}
 
+	/** The default channel's key as `resolveChannel('')` would give it, without nominating one. */
+	private defaultKey(): string {
+		const project = this.config.project?.trim() ?? ''
+		return project && this.defaultChannel ? `${project}/${this.defaultChannel}` : ''
+	}
+
+	/** The default channel the variables were last published for. */
+	private publishedDefault = ''
+
 	private queueRefresh(): void {
-		if (this.refreshQueued) return
+		if (this.refreshQueued || this.destroyed) return
 		this.refreshQueued = setTimeout(() => {
 			this.refreshQueued = undefined
 			this.refresh()
@@ -642,8 +812,10 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	/** Variables track the connection's default channel — see `variables.ts`. */
 	private publishDefaultVariables(): void {
 		const target = this.resolveChannel('')
+		this.publishedDefault = target ? `${target.project}/${target.channel}` : ''
 		if (!target) {
 			this.setVariableValues({
+				project: this.config.project ?? '',
 				channel: '',
 				playback_state: 'unknown',
 				playback_step: '',
@@ -672,8 +844,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			...(table
 				? {
 						table: table.table,
-						page: String(table.page),
-						page_count: String(table.pageCount),
+						page: pageNumber(table)?.toString() ?? '',
+						page_count: Number.isInteger(table.pageCount) ? String(table.pageCount) : '',
 						page_key: table.key ?? '',
 						cycle_state: cycleState(table),
 					}
@@ -705,7 +877,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * most one update a second.
 	 */
 	private startTicker(): void {
-		if (this.ticker) return
+		if (this.ticker || this.destroyed) return
 		this.ticker = setInterval(() => {
 			const target = this.resolveChannel('')
 			if (!target) return
@@ -852,8 +1024,21 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 		if (error instanceof BreezeError) {
 			if (error.status === 401) {
-				this.updateStatus(InstanceStatus.AuthenticationFailure, 'API key rejected')
+				// Held until a command succeeds: a poll or a socket message must
+				// not paint a connection green whose every command is refused.
+				this.keyProblem = this.secrets.apiKey ? 'API key rejected' : 'This server needs an API key'
+				this.setStatus(InstanceStatus.AuthenticationFailure, this.keyProblem)
 				this.log('error', `${what}: ${message} — check the API key against BREEZE_API_KEY`)
+				return
+			}
+			if (error.status === 429) {
+				// Breeze's limit on wrong keys: five a minute from one address.
+				this.keyProblem = 'Too many wrong API keys — Breeze is refusing this machine for up to a minute'
+				this.setStatus(InstanceStatus.AuthenticationFailure, this.keyProblem)
+				this.log(
+					'error',
+					`${what}: refused — five wrong API keys from this machine within a minute. Fix the key; Breeze accepts this machine again once the minute is up`,
+				)
 				return
 			}
 			if (error.status === 404) {
@@ -868,13 +1053,13 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 				return
 			}
 			if (error.status === 0) {
-				this.updateStatus(InstanceStatus.ConnectionFailure, `Cannot reach ${this.api.base}`)
+				this.setStatus(InstanceStatus.ConnectionFailure, `Cannot reach ${this.api.base}`)
 				this.log('error', `${what}: ${message}`)
 				return
 			}
 		}
 
-		this.updateStatus(InstanceStatus.UnknownError, message)
+		this.setStatus(InstanceStatus.UnknownError, message)
 		this.log('error', `${what}: ${message}`)
 	}
 }
@@ -893,4 +1078,19 @@ const EMPTY_TABLE_VARIABLES = {
 function splitKey(key: string): Target {
 	const at = key.indexOf('/')
 	return { project: key.slice(0, at), channel: key.slice(at + 1) }
+}
+
+/**
+ * What a button or variable can show from a channel state — the comparison
+ * that decides whether a new state is worth a feedback pass. Leaves out the
+ * playhead time and the report timestamps, which move on every report without
+ * anything visible changing.
+ */
+function shownOf(state: ChannelState): string {
+	const p = state.playback
+	return JSON.stringify([
+		p ? [p.state, p.step, p.stepCount, p.tables ?? null] : null,
+		state.renderers,
+		state.controllers,
+	])
 }

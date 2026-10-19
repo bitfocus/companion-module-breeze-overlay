@@ -18,6 +18,7 @@ import { combineRgb } from '@companion-module/base'
 import type { CompanionPresetDefinitions, CompanionPresetSection } from '@companion-module/base'
 
 import type { ChannelRef } from './api.js'
+import { listedTables } from './tables.js'
 import type ModuleInstance from './main.js'
 import type { ModuleSchema } from './main.js'
 
@@ -59,6 +60,8 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 
 	for (const entry of channels) {
 		const channel = entry.channel
+		// Preset names, section names and button text all use this, so a channel
+		// with no display name is never listed as " — PLAY".
 		const label = entry.name || channel
 
 		/*
@@ -70,7 +73,7 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 		 */
 		presets[idFor(channel, 'play')] = {
 			type: 'simple',
-			name: `${entry.name} — PLAY`,
+			name: `${label} — PLAY`,
 			style: { text: buttonText(label, 'PLAY'), size: 'auto', color: WHITE, bgcolor: GREEN },
 			steps: [{ down: [{ actionId: 'play', options: { channel } }], up: [] }],
 			feedbacks: [
@@ -89,7 +92,7 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 
 		presets[idFor(channel, 'stop')] = {
 			type: 'simple',
-			name: `${entry.name} — STOP`,
+			name: `${label} — STOP`,
 			style: { text: buttonText(label, 'STOP'), size: 'auto', color: WHITE, bgcolor: BLACK },
 			steps: [{ down: [{ actionId: 'stop', options: { channel } }], up: [] }],
 			feedbacks: [],
@@ -97,7 +100,7 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 
 		presets[idFor(channel, 'next')] = {
 			type: 'simple',
-			name: `${entry.name} — NEXT`,
+			name: `${label} — NEXT`,
 			style: { text: buttonText(label, 'NEXT'), size: 'auto', color: WHITE, bgcolor: BLACK },
 			steps: [{ down: [{ actionId: 'next', options: { channel, table: '' } }], up: [] }],
 			feedbacks: [],
@@ -105,7 +108,7 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 
 		presets[idFor(channel, 'clear')] = {
 			type: 'simple',
-			name: `${entry.name} — CLEAR`,
+			name: `${label} — CLEAR`,
 			style: { text: buttonText(label, 'CLEAR'), size: 'auto', color: WHITE, bgcolor: BLACK },
 			steps: [{ down: [{ actionId: 'clear', options: { channel } }], up: [] }],
 			feedbacks: [],
@@ -121,7 +124,7 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 		if (self.supports('prev') === true) {
 			presets[idFor(channel, 'prev')] = {
 				type: 'simple',
-				name: `${entry.name} — PREV`,
+				name: `${label} — PREV`,
 				style: { text: buttonText(label, 'PREV'), size: 'auto', color: WHITE, bgcolor: BLACK },
 				steps: [{ down: [{ actionId: 'prev', options: { channel, table: '' } }], up: [] }],
 				feedbacks: [],
@@ -136,7 +139,7 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 		if (isScene) {
 			presets[idFor(channel, 'clear_all')] = {
 				type: 'simple',
-				name: `${entry.name} — CLEAR ALL`,
+				name: `${label} — CLEAR ALL`,
 				style: { text: buttonText(label, 'CLR ALL'), size: 'auto', color: WHITE, bgcolor: combineRgb(120, 0, 0) },
 				steps: [{ down: [{ actionId: 'clear_all', options: { channel } }], up: [] }],
 				feedbacks: [],
@@ -144,9 +147,48 @@ export function BuildPresets(self: ModuleInstance, channels: ChannelRef[]): void
 			ids.push(idFor(channel, 'clear_all'))
 		}
 
+		/*
+		 * PAGE: a status button for each table the graphic was built to page —
+		 * the page showing and its key, e.g. "2/2" over "Peoria Pioneers".
+		 * Pressing it does nothing; it only reports.
+		 *
+		 * Offered only where `/api/channels` lists a paged table (Breeze 0.77+),
+		 * so a graphic with nothing to page gets no button that would sit blank.
+		 * The two lines are local variables fed by the Table page feedback, so
+		 * each button watches its own graphic rather than the connection default.
+		 */
+		const tables = listedTables(entry)
+		for (const table of tables) {
+			const id = `${channel}__page__${table.table.replace(/[^A-Za-z0-9_-]/g, '_')}__${nameHash(table.table)}`
+			// With one table the graphic's name says which; with several, the table's.
+			const title = tables.length > 1 ? table.name : label
+			presets[id] = {
+				type: 'simple',
+				name: tables.length > 1 ? `${label} — PAGE (${table.name})` : `${label} — PAGE`,
+				style: { text: `${title}\n$(local:page)\n$(local:key)`, size: 'auto', color: WHITE, bgcolor: BLACK },
+				steps: [{ down: [], up: [] }],
+				feedbacks: [],
+				localVariables: [
+					{
+						variableType: 'feedback',
+						variableName: 'page',
+						feedbackId: 'table_page',
+						options: { channel, table: table.table, show: 'page' },
+					},
+					{
+						variableType: 'feedback',
+						variableName: 'key',
+						feedbackId: 'table_page',
+						options: { channel, table: table.table, show: 'key' },
+					},
+				],
+			}
+			ids.push(id)
+		}
+
 		sections.push({
 			id: `channel-${channel}`,
-			name: entry.sceneId ? `${entry.name} (element of ${entry.sceneId})` : entry.name,
+			name: entry.sceneId ? `${label} (element of ${entry.sceneId})` : label,
 			description: `Channel ${channel}`,
 			keywords: [channel, entry.name, entry.ref].filter(Boolean),
 			definitions: ids,
