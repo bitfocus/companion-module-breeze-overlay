@@ -17,7 +17,17 @@
 
 /** Shape of a verb response. `delivered` is the number of browser sources reached. */
 
-import { isRecord, toChannels, toChannelState, toMode, toProjectChannels, toSources } from './validate.js'
+import type { ScrollInfo, ScrollState, TimerState } from './clocks.js'
+import {
+	isRecord,
+	toChannels,
+	toChannelState,
+	toMode,
+	toProjectChannels,
+	toScrolls,
+	toSources,
+	toTimers,
+} from './validate.js'
 
 export interface VerbResult {
 	ok: boolean
@@ -65,6 +75,33 @@ export interface ChannelState {
 	/** Control panels and editors. */
 	controllers: number
 	updatedAt: string
+	/** Hub clock, epoch ms, when `playback` was reported; null when never (0.74.1+). */
+	reportedAt: number | null
+	/** Hub clock, epoch ms, when this state was put together (0.74.1+). */
+	now: number | null
+}
+
+/** A channel's operator timers (Breeze 0.79+), stamped with the hub's clock. */
+export interface TimersPayload {
+	/** Hub clock, epoch ms, when the server answered. */
+	clock: number
+	timers: Record<string, TimerState>
+}
+
+/** A channel's rolls (Breeze 0.79+): each one's transport and what the outputs said about it. */
+export interface ScrollsPayload {
+	clock: number
+	items: Array<{ id: string; state: ScrollState; info?: ScrollInfo }>
+}
+
+/**
+ * What `/state` carries beside the channel state (Breeze 0.79+). Timers and
+ * rolls ride there so a lean reader still gets them; the socket leaves them
+ * out with the field data.
+ */
+export interface ChannelExtras {
+	timers: TimersPayload | null
+	scrolls: ScrollsPayload | null
 }
 
 /** A table a graphic was built to page, as `/api/channels` lists it (Breeze 0.77+). */
@@ -103,7 +140,20 @@ export interface ProjectSummary {
 
 /** One data source and its health, from `/api/projects/:id/datasources` (Breeze 0.74+ for the backup fields). */
 export interface SourceSummary {
-	def: { id: string; name: string; type: string; fallback?: string; media?: { column: string } }
+	def: {
+		id: string
+		name: string
+		type: string
+		fallback?: string
+		media?: { column: string }
+		/** A source made from a sport template (Breeze 0.79+). */
+		template?: { sport: string; ruleset: string; table: string }
+		/** A poll's question and options (Breeze 0.79+). */
+		question?: string
+		options?: Array<{ id: string; label: string }>
+		/** A URL, for a text source: one with none is held in the project. */
+		url?: string
+	}
 	status: {
 		/** A camera list's checks, when the source has them (0.74+, CYCLE.md Wave 8). */
 		media?: { ok: number; failed: number; frozen: number; unchecked: number; checkedAt?: string }
@@ -262,7 +312,7 @@ export class BreezeApi {
 	async update(
 		project: string,
 		channel: string,
-		fields: Record<string, string>,
+		fields: Record<string, unknown>,
 		signal?: AbortSignal,
 	): Promise<VerbResult> {
 		return this.request<VerbResult>(this.controlPath(project, channel, 'update'), {
@@ -281,12 +331,186 @@ export class BreezeApi {
 	 * 0.74 ignore the parameter and answer as they always did.
 	 */
 	async state(project: string, channel: string): Promise<ChannelState> {
+		return (await this.stateWithExtras(project, channel)).state
+	}
+
+	/**
+	 * `state`, plus the timers and rolls `/state` carries beside it (0.79+).
+	 * The same request — older servers simply have neither.
+	 *
+	 * Works for an output's routing channel too (`@main`): the state route
+	 * reads the hub by name and does not insist on a composition.
+	 */
+	async stateWithExtras(project: string, channel: string): Promise<{ state: ChannelState; extras: ChannelExtras }> {
 		const body = await this.request<unknown>(`${this.controlPath(project, channel, 'state')}?data=0`)
 		const state = toChannelState(isRecord(body) ? body.state : undefined)
 		// Answered, but not with a Breeze channel state — not a dead server, so not
 		// status 0, and not something to colour buttons from either.
 		if (!state) throw new BreezeError(`unexpected state for "${channel}" — is this a Breeze server?`, 502)
-		return state
+		return {
+			state,
+			extras: {
+				timers: toTimers(isRecord(body) ? body.timers : undefined),
+				scrolls: toScrolls(isRecord(body) ? body.scrolls : undefined),
+			},
+		}
+	}
+
+	/**
+	 * A channel's retained field values, read when a press needs the value on
+	 * air now — a toggle, a +1 — and not otherwise: the full state carries
+	 * every source's rows too.
+	 */
+	async fieldValues(project: string, channel: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+		const body = await this.request<unknown>(this.controlPath(project, channel, 'state'), { signal })
+		const state = isRecord(body) && isRecord(body.state) ? body.state : undefined
+		return state && isRecord(state.data) ? state.data : {}
+	}
+
+	/* ------------------------------------------------- 0.79: project reads */
+
+	/** The project document: compositions, layers, typed fields. Read at connect only. */
+	async project(project: string): Promise<unknown> {
+		return this.request<unknown>(`/api/projects/${encodeURIComponent(project)}`)
+	}
+
+	/** `rundowns.json` (0.79+). */
+	async rundowns(project: string): Promise<unknown> {
+		return this.request<unknown>(`/api/projects/${encodeURIComponent(project)}/rundowns`)
+	}
+
+	/** One rundown's armed item and what each target shows (0.79+) — the fallback when the socket is down. */
+	async rundownState(project: string, rundown: string): Promise<unknown> {
+		return this.request<unknown>(`/api/rundown/${encodeURIComponent(project)}/${encodeURIComponent(rundown)}/state`)
+	}
+
+	/** The sports catalogue (0.79+): each sport's scoring buttons. */
+	async sports(): Promise<unknown> {
+		return this.request<unknown>('/api/sports')
+	}
+
+	/** One source with its first `rows` rows (0.79+ for game and poll rows). */
+	async sourceRows(project: string, source: string, rows: number): Promise<Array<Record<string, unknown>>> {
+		const body = await this.request<unknown>(
+			`/api/projects/${encodeURIComponent(project)}/datasources/${encodeURIComponent(source)}?rows=${rows}`,
+		)
+		const data = isRecord(body) && isRecord(body.data) ? body.data : undefined
+		return Array.isArray(data?.rows) ? data.rows.filter(isRecord) : []
+	}
+
+	/* ------------------------------------------------ 0.79: control verbs */
+
+	/**
+	 * A rundown verb (0.79+): `cue`, `next`, `prev`, `take` or `out`. Options
+	 * (`item`, `advance`, `target`) go in the body. The answer carries the
+	 * armed item, and for TAKE how many outputs it reached.
+	 */
+	async rundownVerb(
+		project: string,
+		rundown: string,
+		verb: 'cue' | 'next' | 'prev' | 'take' | 'out',
+		options: Record<string, unknown>,
+		signal?: AbortSignal,
+	): Promise<{ armed: string | null | undefined; delivered: number | undefined }> {
+		const body = await this.request<unknown>(
+			`/api/rundown/${encodeURIComponent(project)}/${encodeURIComponent(rundown)}/${verb}`,
+			{ method: 'POST', body: JSON.stringify(options), signal },
+		)
+		const armed = isRecord(body) ? body.armed : undefined
+		const delivered = isRecord(body) ? body.delivered : undefined
+		return {
+			armed: typeof armed === 'string' || armed === null ? armed : undefined,
+			delivered: typeof delivered === 'number' ? delivered : undefined,
+		}
+	}
+
+	/** An output's own verb (0.79+): `stop`, `next`, `prev` or `clear`, at one mount or all. */
+	async outputVerb(
+		project: string,
+		output: string,
+		verb: 'stop' | 'next' | 'prev' | 'clear',
+		mount: string | undefined,
+		signal?: AbortSignal,
+	): Promise<VerbResult> {
+		return this.request<VerbResult>(`/api/out/${encodeURIComponent(project)}/${encodeURIComponent(output)}/${verb}`, {
+			method: 'POST',
+			...(mount ? { body: JSON.stringify({ mount }) } : {}),
+			signal,
+		})
+	}
+
+	/**
+	 * The path for a channel's timer or roll verb: an output's (`@main`) or a
+	 * graphic's. The two share their arguments; only the route differs.
+	 */
+	private clockPath(project: string, channel: string, verb: 'timer' | 'scroll'): string {
+		if (channel.startsWith('@')) {
+			return `/api/out/${encodeURIComponent(project)}/${encodeURIComponent(channel.slice(1))}/${verb}`
+		}
+		return this.controlPath(project, channel, verb)
+	}
+
+	/**
+	 * An operator timer (0.79+): `action` start | pause | toggle | reset | set | add,
+	 * `value` as an operator types it (`8:00`, `-10`).
+	 */
+	async timer(
+		project: string,
+		channel: string,
+		action: string,
+		id: string,
+		value: string | undefined,
+		signal?: AbortSignal,
+	): Promise<VerbResult> {
+		return this.request<VerbResult>(this.clockPath(project, channel, 'timer'), {
+			method: 'POST',
+			body: JSON.stringify({ action, id, ...(value !== undefined ? { value } : {}) }),
+			signal,
+		})
+	}
+
+	/** The roll transport (0.79+). `value` for speed (`1.5`), jog (`-3`) and seek (`1:30`, `50%`). */
+	async scroll(
+		project: string,
+		channel: string,
+		action: string,
+		id: string,
+		value: string | undefined,
+		signal?: AbortSignal,
+	): Promise<VerbResult> {
+		return this.request<VerbResult>(this.clockPath(project, channel, 'scroll'), {
+			method: 'POST',
+			body: JSON.stringify({ action, id, ...(value !== undefined ? { value } : {}) }),
+			signal,
+		})
+	}
+
+	/** A tap on a sport game table (0.79+). Answers with the new game row. */
+	async game(
+		project: string,
+		source: string,
+		action: Record<string, unknown>,
+		signal?: AbortSignal,
+	): Promise<Record<string, unknown> | null> {
+		const body = await this.request<unknown>(
+			`/api/projects/${encodeURIComponent(project)}/datasources/${encodeURIComponent(source)}/game`,
+			{ method: 'POST', body: JSON.stringify(action), signal },
+		)
+		return isRecord(body) && isRecord(body.row) ? body.row : null
+	}
+
+	/** A poll tally (0.79+): vote, set, open, close or reset. Answers with the poll's rows. */
+	async poll(
+		project: string,
+		source: string,
+		action: Record<string, unknown>,
+		signal?: AbortSignal,
+	): Promise<Array<Record<string, unknown>> | null> {
+		const body = await this.request<unknown>(
+			`/api/projects/${encodeURIComponent(project)}/datasources/${encodeURIComponent(source)}/poll`,
+			{ method: 'POST', body: JSON.stringify(action), signal },
+		)
+		return isRecord(body) && Array.isArray(body.rows) ? body.rows.filter(isRecord) : null
 	}
 
 	async projects(): Promise<ProjectSummary[]> {

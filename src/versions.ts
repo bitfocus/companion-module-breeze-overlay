@@ -30,6 +30,20 @@ export const MIN_VERSION = {
 	media: '0.74.0',
 	/** `GET /api/auth`: whether the server needs a key, read at connect. */
 	auth: '0.74.0',
+	/** Rundowns: cue, TAKE and the rundown channel (Phase 9 Wave A). */
+	rundowns: '0.79.0',
+	/** Outputs: `/api/out/:id/:output/*`, one browser source carrying several graphics (Wave A). */
+	outputs: '0.79.0',
+	/** Operator timers on text layers (Wave B). */
+	timers: '0.79.0',
+	/** Sport game tables: `POST …/datasources/:id/game` and `/api/sports` (Wave B). */
+	game: '0.79.0',
+	/** Typed fields: `Composition.fields` (Wave B). */
+	fields: '0.79.0',
+	/** The roll transport (Wave R). */
+	scroll: '0.79.0',
+	/** Operator polls: `POST …/datasources/:id/poll` (Wave R). */
+	polls: '0.79.0',
 } as const
 
 export type Feature = keyof typeof MIN_VERSION

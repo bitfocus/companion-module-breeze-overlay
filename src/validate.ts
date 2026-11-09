@@ -12,7 +12,17 @@
  * rather than wrong.
  */
 
-import type { ChannelRef, ChannelState, PlaybackReport, ProjectChannels, SourceSummary, TableReport } from './api.js'
+import type {
+	ChannelRef,
+	ChannelState,
+	PlaybackReport,
+	ProjectChannels,
+	ScrollsPayload,
+	SourceSummary,
+	TableReport,
+	TimersPayload,
+} from './api.js'
+import type { ScrollInfo, ScrollState, TimerState } from './clocks.js'
 
 type Loose = Record<string, unknown>
 
@@ -75,6 +85,8 @@ export function toChannelState(raw: unknown): ChannelState | null {
 		renderers,
 		controllers,
 		updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : '',
+		reportedAt: finite(raw.reportedAt),
+		now: finite(raw.now),
 	}
 }
 
@@ -121,6 +133,24 @@ function toSource(raw: unknown): SourceSummary | null {
 			type: typeof def.type === 'string' ? def.type : '',
 			...(typeof def.fallback === 'string' ? { fallback: def.fallback } : {}),
 			...(isRecord(def.media) && typeof def.media.column === 'string' ? { media: { column: def.media.column } } : {}),
+			...(isRecord(def.template) &&
+			typeof def.template.sport === 'string' &&
+			typeof def.template.ruleset === 'string' &&
+			typeof def.template.table === 'string'
+				? { template: { sport: def.template.sport, ruleset: def.template.ruleset, table: def.template.table } }
+				: {}),
+			...(typeof def.question === 'string' ? { question: def.question } : {}),
+			...(Array.isArray(def.options)
+				? {
+						options: def.options
+							.filter((o): o is Loose => isRecord(o) && typeof o.id === 'string' && o.id !== '')
+							.map((o) => ({
+								id: o.id as string,
+								label: typeof o.label === 'string' && o.label ? o.label : (o.id as string),
+							})),
+					}
+				: {}),
+			...(typeof def.url === 'string' && def.url !== '' ? { url: def.url } : {}),
 		},
 		status: {
 			...(media
@@ -159,3 +189,67 @@ export function toMode(raw: unknown): { mode: string; modes: string[] } {
 }
 
 export { isRecord }
+
+/** One timer's state, or null. Times must be numbers: a `NaN` here would print as one on a button. */
+function toTimerState(raw: unknown): TimerState | null {
+	if (!isRecord(raw)) return null
+	const anchor = finite(raw.anchor)
+	const elapsed = finite(raw.elapsed)
+	if (anchor === null || elapsed === null) return null
+	const base = finite(raw.base)
+	return {
+		running: raw.running === true,
+		anchor,
+		elapsed,
+		...(base !== null ? { base } : {}),
+		adjust: finite(raw.adjust) ?? 0,
+	}
+}
+
+/** `/state`'s `timers` (Breeze 0.79+), or null when the channel has none. */
+export function toTimers(raw: unknown): TimersPayload | null {
+	if (!isRecord(raw) || !isRecord(raw.timers)) return null
+	const clock = finite(raw.clock)
+	if (clock === null) return null
+	const timers: Record<string, TimerState> = {}
+	for (const [id, state] of Object.entries(raw.timers)) {
+		const timer = toTimerState(state)
+		if (timer) timers[id] = timer
+	}
+	return { clock, timers }
+}
+
+function toScrollState(raw: unknown): ScrollState | null {
+	if (!isRecord(raw)) return null
+	const anchor = finite(raw.anchor)
+	const base = finite(raw.base)
+	const rate = finite(raw.rate)
+	if (anchor === null || base === null || rate === null) return null
+	return { running: raw.running === true, anchor, base, rate }
+}
+
+function toScrollInfo(raw: unknown): ScrollInfo | undefined {
+	if (!isRecord(raw)) return undefined
+	const extent = finite(raw.extent)
+	return {
+		...(extent !== null && extent > 0 ? { extent } : {}),
+		...(typeof raw.end === 'string' ? { end: raw.end } : {}),
+		...(typeof raw.start === 'string' ? { start: raw.start } : {}),
+	}
+}
+
+/** `/state`'s `scrolls` (Breeze 0.79+), or null when the channel has no rolls. */
+export function toScrolls(raw: unknown): ScrollsPayload | null {
+	if (!isRecord(raw) || !Array.isArray(raw.items)) return null
+	const clock = finite(raw.clock)
+	if (clock === null) return null
+	const items: ScrollsPayload['items'] = []
+	for (const item of raw.items) {
+		if (!isRecord(item) || typeof item.id !== 'string' || item.id === '') continue
+		const state = toScrollState(item.state)
+		if (!state) continue
+		const info = toScrollInfo(item.info)
+		items.push({ id: item.id, state, ...(info ? { info } : {}) })
+	}
+	return { clock, items }
+}

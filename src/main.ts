@@ -22,7 +22,43 @@
 
 import { InstanceBase, InstanceStatus, type SomeCompanionConfigField } from '@companion-module/base'
 
-import { BreezeApi, BreezeError, type ChannelState, type SourceSummary, type TableReport } from './api.js'
+import {
+	BreezeApi,
+	BreezeError,
+	type ChannelExtras,
+	type ChannelRef,
+	type ChannelState,
+	type SourceSummary,
+	type TableReport,
+} from './api.js'
+import {
+	cellText,
+	readCompositions,
+	readRundownLive,
+	readRundowns,
+	readSports,
+	itemTitle,
+	type CompositionInfo,
+	type Rundown,
+	type RundownItem,
+	type RundownLive,
+	type SportInfo,
+} from './catalogue.js'
+import {
+	UNKNOWN_TIMER,
+	scrollAtEnd,
+	scrollPercent,
+	scrollRemaining,
+	speedText,
+	timerFinished,
+	timerMs,
+	timerRunning,
+	timerText,
+	timerTickMs,
+	type ScrollInfo,
+	type ScrollState,
+	type TimerSettings,
+} from './clocks.js'
 import { GetConfigFields, type ModuleConfig, type ModuleSecrets } from './config.js'
 import { UpdateActions, type ActionsSchema } from './actions.js'
 import { UpdateFeedbacks, type FeedbacksSchema } from './feedbacks.js'
@@ -52,6 +88,69 @@ interface Target {
 
 /** Every feedback reads the same cache, so every change re-checks them all. */
 const ALL_FEEDBACKS = ['on_air', 'playback_state', 'source_connected', 'cycle_held', 'page_is', 'table_page'] as const
+
+/** Feedbacks that read timers and rolls (0.79+): re-checked when those change, and as a clock ticks. */
+const CLOCK_FEEDBACKS = [
+	'timer_running',
+	'timer_under',
+	'timer_value',
+	'roll_is',
+	'roll_value',
+	'roll_color',
+	'playhead_value',
+	'playback_color',
+] as const
+
+/** Feedbacks that read the rundowns (0.79+). */
+const RUNDOWN_FEEDBACKS = ['rundown_item', 'rundown_cued_differs', 'rundown_value'] as const
+
+/** Feedbacks that read a game table's or a poll's rows (0.79+). */
+const ROW_FEEDBACKS = ['game_value', 'game_column_is', 'poll_value', 'poll_open', 'poll_leading'] as const
+
+/** How many rows to read of a watched source: a game table's state is its first row; a poll has at most 12. */
+const ROWS_READ = 12
+
+/** One channel's timers and rolls, as `/state` last gave them, with the hub's clock offset at that moment. */
+interface Clocks extends ChannelExtras {
+	/** Hub clock minus ours, ms. Network delay is ignored: it is far below a timer's second. */
+	offset: number
+}
+
+/** What a timer shows on a button. */
+export interface TimerView {
+	id: string
+	text: string
+	/** Whole seconds — rounded up for a countdown, down otherwise, as the text is. */
+	seconds: number
+	running: boolean
+	finished: boolean
+}
+
+/** What the output page's debug overlay shows for a graphic, worked out on this side. */
+export interface PlayheadView {
+	state: string
+	/** Seconds into the composition — carried forward from the last report while it plays. */
+	time: number
+	/** Seconds, from the project document; null before it is read. */
+	duration: number | null
+	step: number
+	stepCount: number
+	/** 0–100 through the composition; 0 without a duration. */
+	percent: number
+}
+
+/** What a roll shows on a button. */
+export interface RollView {
+	id: string
+	/** 0–100, or null until an output has said how long the text is. */
+	percent: number | null
+	running: boolean
+	reversed: boolean
+	atEnd: boolean
+	speed: string
+	/** Real seconds to the end it is heading for at this speed; null for a loop or before the length is known. */
+	remaining: number | null
+}
 
 /** How often to prove the server is still there while every channel is live. */
 const WATCHDOG_MS = 5000
@@ -121,6 +220,48 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 */
 	private sourcesGeneration = 0
 
+	/* 0.79: what the project holds, read at connect — see `catalogue.ts`. */
+	private compositions = new Map<string, CompositionInfo>()
+	private rundownList: Rundown[] = []
+	private sportsInfo = new Map<string, SportInfo>()
+	/** The connection's own project's channels from `/api/channels`, by channel name. */
+	private channelRefs = new Map<string, ChannelRef>()
+
+	/** Armed and on air, per rundown, as the rundown channel last said. */
+	private rundownLive = new Map<string, RundownLive>()
+	/** The rundown channel's socket — `project/#rundowns`, with its (small) data. */
+	private rundownSocket: LiveChannel | undefined
+	/** `$rundownsRev` as last seen, so a save is noticed once. */
+	private rundownsRev: unknown
+	private rundownTimer: NodeJS.Timeout | undefined
+	private rundownsReload: NodeJS.Timeout | undefined
+	private rundownsInflight = false
+	/** The rundown variables last published, so an unchanged set is not sent again. */
+	private rundownShown = ''
+	private timerShown = ''
+	private gameShown = ''
+
+	/** Timers and rolls per channel key, from `/state` (0.79+). */
+	private clocks = new Map<string, Clocks>()
+	/** Owners (`feedback:<id>`) that show a timer or a roll, so their channel's clocks are kept fresh. */
+	private clockOwners = new Set<string>()
+	private clocksQueued = new Set<string>()
+	private clocksTimer: NodeJS.Timeout | undefined
+	private clockTicker: NodeJS.Timeout | undefined
+	private clockSignature = ''
+	/** Owners that show a playhead, so it is ticked while the graphic plays. */
+	private playheadOwners = new Set<string>()
+	/** When each channel's state last arrived, by our clock — to carry a report forward. */
+	private receivedAt = new Map<string, number>()
+
+	/** Game and poll rows per source id, as last read (0.79+). */
+	private rows = new Map<string, Array<Record<string, unknown>>>()
+	/** Which placed action or feedback reads which source's rows. */
+	private rowOwners = new Map<string, string>()
+	private rowsTimer: NodeJS.Timeout | undefined
+	private rowsInflight = false
+	private rowsSignature = ''
+
 	/**
 	 * Bumped by every `connect()` and by `destroy()`.
 	 *
@@ -177,6 +318,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			media_down: '',
 			mode: '',
 			...EMPTY_TABLE_VARIABLES,
+			...EMPTY_RUNDOWN_VARIABLES,
+			...EMPTY_TIMER_VARIABLES,
+			...EMPTY_GAME_VARIABLES,
 		})
 
 		/*
@@ -201,6 +345,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.stopSourcePolling()
 		this.stopSockets()
 		this.stopTicker()
+		this.stopRundowns()
+		this.stopClocks()
+		this.stopRows()
 		if (this.refreshQueued) clearTimeout(this.refreshQueued)
 		this.refreshQueued = undefined
 	}
@@ -210,6 +357,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.secrets = secrets ?? { apiKey: '' }
 		// Sockets dial the old address; drop them before the API is replaced.
 		this.stopSockets()
+		this.stopRundowns()
+		this.stopClocks()
+		this.stopRows()
 		this.applyConfig()
 		// The cache belongs to the old server; keeping it would colour buttons
 		// from a machine this connection no longer points at.
@@ -220,7 +370,33 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.sourcesSignature = ''
 		this.sourcesGeneration += 1
 		this.sourcesInflight = undefined
-		this.setVariableValues({ sources_failing: '', sources_on_backup: '', media_up: '', media_down: '', mode: '' })
+		this.setVariableValues({
+			sources_failing: '',
+			sources_on_backup: '',
+			media_up: '',
+			media_down: '',
+			mode: '',
+			...EMPTY_RUNDOWN_VARIABLES,
+			...EMPTY_TIMER_VARIABLES,
+			...EMPTY_GAME_VARIABLES,
+		})
+		this.compositions.clear()
+		this.rundownList = []
+		this.sportsInfo.clear()
+		this.channelRefs.clear()
+		this.rundownLive.clear()
+		this.rundownsRev = undefined
+		this.rundownShown = ''
+		this.timerShown = ''
+		this.gameShown = ''
+		this.clocks.clear()
+		this.clockOwners.clear()
+		this.playheadOwners.clear()
+		this.receivedAt.clear()
+		this.clockSignature = ''
+		this.rows.clear()
+		this.rowOwners.clear()
+		this.rowsSignature = ''
 		this.serverVersion = ''
 		this.reachable = null
 		// The key may be the thing that was just fixed.
@@ -289,6 +465,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.syncSockets()
 		this.startPolling()
 		this.startSourcePolling()
+		this.syncRundowns()
+		this.startRows()
 	}
 
 	/**
@@ -504,6 +682,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.setVariableValues({ server_version: version })
 		if (before) this.log('info', `Breeze server is now ${version} (was ${before})`)
 		this.syncSockets()
+		this.syncRundowns()
 		// PREV is only offered to servers that have it.
 		if (rebuildPresets) void this.refreshPresets()
 	}
@@ -550,6 +729,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 				this.setPresetDefinitions([], {})
 				return
 			}
+			this.channelRefs = new Map(mine.channels.map((c) => [c.channel, c]))
+			await this.readCatalogue(project, generation)
+			if (!this.isCurrent(generation)) return
 			BuildPresets(this, mine.channels)
 			this.log('debug', `Built presets for ${mine.channels.length} channels in ${mine.name}`)
 		} catch (error) {
@@ -584,6 +766,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 					if (!this.isWatched(channel)) return
 					this.acceptState(channel, state)
 					this.markReachable(true)
+					// The hub sends a state on every timer or roll command, but the
+					// lean socket leaves the clocks out; read them from /state.
+					if (this.wantsClocks(channel)) this.queueClocks(channel)
 				},
 				open: () => {
 					this.markReachable(true)
@@ -727,11 +912,14 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 				// connection's configured project.
 				const { project, channel } = splitKey(key)
 				try {
-					const state = await this.api.state(project, channel)
+					const { state, extras } = await this.api.stateWithExtras(project, channel)
 					if (!this.isCurrent(generation)) return
 					// Released while the request was in flight — or taken over by
 					// a socket — so do not overwrite it.
-					if (this.isWatched(key) && !this.isLive(key)) changed = this.acceptState(key, state, true) || changed
+					if (this.isWatched(key) && !this.isLive(key)) {
+						changed = this.acceptState(key, state, true) || changed
+						this.acceptClocks(key, extras)
+					}
 					reachable = true
 				} catch (error) {
 					if (!this.isCurrent(generation)) return
@@ -776,6 +964,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	private acceptState(key: string, state: ChannelState, immediate = false): boolean {
 		const before = this.states.get(key)
 		this.states.set(key, state)
+		this.receivedAt.set(key, Date.now())
 
 		const signature = JSON.stringify(state.playback?.tables ?? null)
 		if (this.tableStamps.get(key)?.signature !== signature) {
@@ -807,6 +996,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	private refresh(): void {
 		this.publishDefaultVariables()
 		this.checkFeedbacks(...ALL_FEEDBACKS)
+		// A graphic starting to play starts the playhead ticking.
+		this.onClocksChanged()
 	}
 
 	/** Variables track the connection's default channel — see `variables.ts`. */
@@ -856,6 +1047,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.setVariableValues({ cycle_seconds_left: this.lastSecondsLeft })
 		if (table?.cycling && !table.held) this.startTicker()
 		else this.stopTicker()
+		// The default channel may have moved; its timer goes with it.
+		this.publishTimerVariables()
 	}
 
 	/**
@@ -893,6 +1086,622 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	private stopTicker(): void {
 		if (this.ticker) clearInterval(this.ticker)
 		this.ticker = undefined
+	}
+
+	/* ----------------------------------------------- 0.79: the catalogue */
+
+	/**
+	 * Read what the project holds — compositions, rundowns, the sports — for
+	 * presets and for showing timers as the output shows them. Each read stands
+	 * alone: a failure leaves that part empty and the rest working.
+	 */
+	private async readCatalogue(project: string, generation: number): Promise<void> {
+		// The project document is as old as Breeze: durations and markers for
+		// the DEBUG buttons on any server. The rest is 0.79's.
+		try {
+			const doc = await this.api.project(project)
+			if (!this.isCurrent(generation)) return
+			this.compositions = readCompositions(doc)
+		} catch (error) {
+			if (!this.isCurrent(generation)) return
+			this.log('debug', `Could not read the project's compositions: ${messageOf(error)}`)
+		}
+		if (this.supports('rundowns') !== true) {
+			this.rundownList = []
+			this.sportsInfo.clear()
+			return
+		}
+		await this.readRundownsDoc(project, generation)
+		if (!this.isCurrent(generation)) return
+		try {
+			const sports = await this.api.sports()
+			if (!this.isCurrent(generation)) return
+			this.sportsInfo = readSports(sports)
+		} catch {
+			// Only the game presets need it; they are left out.
+		}
+		this.onClocksChanged(true)
+	}
+
+	private async readRundownsDoc(project: string, generation: number): Promise<void> {
+		try {
+			const doc = await this.api.rundowns(project)
+			if (!this.isCurrent(generation)) return
+			this.rundownList = readRundowns(doc)
+		} catch (error) {
+			if (!this.isCurrent(generation)) return
+			this.log('debug', `Could not read the project's rundowns: ${messageOf(error)}`)
+		}
+		this.publishRundownVariables()
+		this.checkFeedbacks(...RUNDOWN_FEEDBACKS)
+	}
+
+	/** The project's compositions with their timers, rolls and fields — for presets. */
+	compositionList(): CompositionInfo[] {
+		return [...this.compositions.values()]
+	}
+
+	/** The project's rundowns, in `rundowns.json` order — for presets and option defaults. */
+	rundowns(): Rundown[] {
+		return this.rundownList
+	}
+
+	/** A sport's scoring buttons, from `/api/sports`. */
+	sport(id: string): SportInfo | undefined {
+		return this.sportsInfo.get(id)
+	}
+
+	/** The project's sport game tables — manual sources made from a template's `game` table. */
+	gameSources(): SourceSummary[] {
+		return [...this.sources.values()].filter((s) => s.def.type === 'manual' && s.def.template?.table === 'game')
+	}
+
+	/** The project's operator polls. */
+	pollList(): SourceSummary[] {
+		return [...this.sources.values()].filter((s) => s.def.type === 'poll')
+	}
+
+	/** Output names the rundowns take items onto, in first-use order. */
+	outputNames(): string[] {
+		const names: string[] = []
+		for (const rundown of this.rundownList) {
+			for (const item of rundown.items) if (item.output && !names.includes(item.output)) names.push(item.output)
+		}
+		return names
+	}
+
+	/** The compositions the rundowns take onto an output. */
+	outputCompositions(output: string): string[] {
+		const ids: string[] = []
+		for (const rundown of this.rundownList) {
+			for (const item of rundown.items) {
+				if (item.output === output && !ids.includes(item.composition)) ids.push(item.composition)
+			}
+		}
+		return ids
+	}
+
+	/** The composition a channel plays: a scene or element's own, or an output's first. */
+	compositionFor(channel: string): CompositionInfo | undefined {
+		if (channel.startsWith('@')) {
+			const first = this.outputCompositions(channel.slice(1))[0]
+			return first ? this.compositions.get(first) : undefined
+		}
+		return this.compositions.get(this.channelRefs.get(channel)?.ref ?? channel)
+	}
+
+	/* ------------------------------------------------ 0.79: rundowns */
+
+	/** A rundown by id, or the first one for a blank field. */
+	rundownFor(raw: string | undefined): Rundown | undefined {
+		const id = (raw ?? '').trim()
+		if (!id) return this.rundownList[0]
+		return this.rundownList.find((r) => r.id === id)
+	}
+
+	/** The rundown id an action should send: the one named, or the first. Blank when there is none. */
+	rundownId(raw: string | undefined): string {
+		const id = (raw ?? '').trim()
+		return id || this.rundownList[0]?.id || ''
+	}
+
+	/** Armed and on air for a rundown, as last heard. */
+	rundownState(id: string): RundownLive | undefined {
+		return this.rundownLive.get(id)
+	}
+
+	/** What a press just answered — the next button press reads it, not the last broadcast. */
+	noteArmed(rundown: string, armed: string | null | undefined): void {
+		if (armed === undefined) return
+		const live = this.rundownLive.get(rundown) ?? { armed: null, onAir: {} }
+		if (live.armed === armed) return
+		this.rundownLive.set(rundown, { ...live, armed })
+		this.publishRundownVariables()
+		this.checkFeedbacks(...RUNDOWN_FEEDBACKS)
+	}
+
+	/** An item's title as the rundown panel shows it. */
+	itemTitle(item: RundownItem | undefined): string {
+		return item ? itemTitle(item, this.compositions.get(item.composition)?.name) : ''
+	}
+
+	/**
+	 * Follow the rundown channel while the server has rundowns. The socket asks
+	 * for the channel's data: it is only `$rundown` and `$rundownsRev`, since
+	 * Breeze sends no data-source rows to that channel.
+	 */
+	private syncRundowns(): void {
+		if (this.destroyed) return
+		const project = this.config.project?.trim() ?? ''
+		const wanted = project !== '' && this.supports('rundowns') === true
+		const key = `${project}/#rundowns`
+		if (!wanted || !this.liveEnabled()) {
+			this.rundownSocket?.stop()
+			this.rundownSocket = undefined
+		} else if (this.rundownSocket?.key !== key) {
+			this.rundownSocket?.stop()
+			this.rundownSocket = new LiveChannel(
+				this.api.socketUrl,
+				key,
+				{
+					state: (_key, state) => this.acceptRundownData(state.data),
+					open: () => undefined,
+					close: () => void this.pollRundowns(),
+				},
+				true,
+			)
+			this.rundownSocket.start()
+		}
+		// The fallback: read each rundown's state while the socket is not live.
+		if (wanted && !this.rundownTimer) {
+			const interval = Math.max(1000, this.config.pollInterval ?? 1000)
+			this.rundownTimer = setInterval(() => void this.pollRundowns(), interval)
+		} else if (!wanted && this.rundownTimer) {
+			clearInterval(this.rundownTimer)
+			this.rundownTimer = undefined
+		}
+	}
+
+	private stopRundowns(): void {
+		this.rundownSocket?.stop()
+		this.rundownSocket = undefined
+		if (this.rundownTimer) clearInterval(this.rundownTimer)
+		this.rundownTimer = undefined
+		if (this.rundownsReload) clearTimeout(this.rundownsReload)
+		this.rundownsReload = undefined
+	}
+
+	private acceptRundownData(data: Record<string, unknown>): void {
+		if (this.destroyed) return
+		const live = readRundownLive(data['$rundown'])
+		this.applyRundownLive(live, true)
+		const rev = data['$rundownsRev']
+		if (rev !== undefined && rev !== this.rundownsRev) {
+			// The first revision seen is the one the catalogue was read at.
+			const saved = this.rundownsRev !== undefined
+			this.rundownsRev = rev
+			if (saved) this.queueRundownsReload()
+		}
+	}
+
+	private applyRundownLive(live: Map<string, RundownLive>, replace: boolean): void {
+		const next = replace ? live : new Map([...this.rundownLive, ...live])
+		if (JSON.stringify([...next]) === JSON.stringify([...this.rundownLive])) return
+		this.rundownLive = next
+		this.publishRundownVariables()
+		this.checkFeedbacks(...RUNDOWN_FEEDBACKS)
+	}
+
+	private async pollRundowns(): Promise<void> {
+		if (this.destroyed || this.rundownsInflight || this.rundownSocket?.live) return
+		const project = this.config.project?.trim() ?? ''
+		if (!project || this.rundownList.length === 0) return
+		const generation = this.generation
+		this.rundownsInflight = true
+		try {
+			const read = new Map<string, RundownLive>()
+			for (const rundown of this.rundownList) {
+				try {
+					const body = await this.api.rundownState(project, rundown.id)
+					if (!this.isCurrent(generation)) return
+					const live = readRundownLive({ [rundown.id]: body }).get(rundown.id)
+					if (live) read.set(rundown.id, live)
+				} catch {
+					// The channel poll and the watchdog report the server.
+				}
+			}
+			if (this.isCurrent(generation) && !this.rundownSocket?.live) this.applyRundownLive(read, false)
+		} finally {
+			this.rundownsInflight = false
+		}
+	}
+
+	/** `rundowns.json` was saved: re-read it, and rebuild the presets so new items get buttons. */
+	private queueRundownsReload(): void {
+		if (this.rundownsReload || this.destroyed) return
+		this.rundownsReload = setTimeout(() => {
+			this.rundownsReload = undefined
+			void this.refreshPresets()
+		}, 500)
+	}
+
+	/** Variables follow the first rundown — see `variables.ts`. */
+	private publishRundownVariables(): void {
+		const rundown = this.rundownList[0]
+		const live = rundown ? this.rundownLive.get(rundown.id) : undefined
+		const armed = rundown?.items.find((i) => i.id === live?.armed)
+		const at = armed ? rundown.items.indexOf(armed) : -1
+		let onAirId: string | undefined
+		if (live) {
+			onAirId = armed ? live.onAir[armed.output ? `@${armed.output}` : armed.composition] : undefined
+			onAirId ??= Object.values(live.onAir).at(-1)
+		}
+		const onAir = rundown?.items.find((i) => i.id === onAirId)
+		const values = {
+			rundown: rundown?.name ?? '',
+			cued_item: this.itemTitle(armed),
+			cued_composition: armed ? (this.compositions.get(armed.composition)?.name ?? armed.composition) : '',
+			cued_position: armed ? `${at + 1}/${rundown.items.length}` : '',
+			on_air_item: this.itemTitle(onAir),
+		}
+		const shown = JSON.stringify(values)
+		if (shown === this.rundownShown) return
+		this.rundownShown = shown
+		this.setVariableValues(values)
+	}
+
+	/* --------------------------------------------- 0.79: timers and rolls */
+
+	/** Claim a channel for a timer or roll feedback, so its clocks are read. */
+	trackClocks(ownerId: string, raw: string | undefined): string | null {
+		const target = this.track(ownerId, raw)
+		if (!target) return null
+		this.clockOwners.add(ownerId)
+		const key = `${target.project}/${target.channel}`
+		if (!this.clocks.has(key)) this.queueClocks(key)
+		return key
+	}
+
+	/** Whether anything shows this channel's timers or rolls — the default channel's variables count. */
+	private wantsClocks(key: string): boolean {
+		if (this.supports('timers') === false) return false
+		if (key === this.defaultKey()) return true
+		for (const owner of this.clockOwners) if (this.owners.get(owner) === key) return true
+		return false
+	}
+
+	/** Read a channel's clocks soon. Bursts — a command and its echo — collapse into one read. */
+	queueClocks(key: string): void {
+		if (this.destroyed || this.supports('timers') === false) return
+		this.clocksQueued.add(key)
+		if (this.clocksTimer) return
+		this.clocksTimer = setTimeout(() => {
+			this.clocksTimer = undefined
+			void this.readClocks()
+		}, 100)
+	}
+
+	private async readClocks(): Promise<void> {
+		const keys = [...this.clocksQueued]
+		this.clocksQueued.clear()
+		const generation = this.generation
+		for (const key of keys) {
+			const { project, channel } = splitKey(key)
+			try {
+				const { extras } = await this.api.stateWithExtras(project, channel)
+				if (!this.isCurrent(generation)) return
+				if (this.isWatched(key)) this.acceptClocks(key, extras)
+			} catch {
+				// The poll and the watchdog report the server.
+			}
+		}
+	}
+
+	private acceptClocks(key: string, extras: ChannelExtras): void {
+		if (this.supports('timers') === false) return
+		const clock = extras.timers?.clock ?? extras.scrolls?.clock
+		this.clocks.set(key, { ...extras, offset: clock !== undefined ? clock - Date.now() : 0 })
+		this.onClocksChanged()
+	}
+
+	private stopClocks(): void {
+		if (this.clocksTimer) clearTimeout(this.clocksTimer)
+		this.clocksTimer = undefined
+		this.clocksQueued.clear()
+		if (this.clockTicker) clearInterval(this.clockTicker)
+		this.clockTicker = undefined
+	}
+
+	/** The settings of the layer that shows a timer on a channel; a plain count-up when none does. */
+	private timerSettings(channel: string, id: string): TimerSettings {
+		const own = channel.startsWith('@')
+			? this.outputCompositions(channel.slice(1)).map((c) => this.compositions.get(c))
+			: [this.compositionFor(channel)]
+		for (const comp of own) {
+			const found = comp?.timers.get(id)
+			if (found) return found
+		}
+		for (const comp of this.compositions.values()) {
+			const found = comp.timers.get(id)
+			if (found) return found
+		}
+		return UNKNOWN_TIMER
+	}
+
+	/** Timer ids a channel shows: its layers' first, then any the hub has state for. */
+	timerIds(channel: string, key?: string): string[] {
+		const ids: string[] = []
+		const comps = channel.startsWith('@')
+			? this.outputCompositions(channel.slice(1)).map((c) => this.compositions.get(c))
+			: [this.compositionFor(channel)]
+		for (const comp of comps) for (const id of comp?.timers.keys() ?? []) if (!ids.includes(id)) ids.push(id)
+		const held = key ? this.clocks.get(key)?.timers?.timers : undefined
+		for (const id of Object.keys(held ?? {})) if (!ids.includes(id)) ids.push(id)
+		return ids
+	}
+
+	private viewTimer(key: string, rawId: string | undefined): TimerView | undefined {
+		const clocks = this.clocks.get(key)
+		const { channel } = splitKey(key)
+		const ids = (rawId ?? '').trim() ? [] : this.timerIds(channel, key)
+		const id = (rawId ?? '').trim() || (ids.includes('main') ? 'main' : ids[0])
+		if (!id || !clocks) return undefined
+		const state = clocks.timers?.timers[id]
+		const settings = this.timerSettings(channel, id)
+		// Nothing describes it and nothing has run it: no such timer here.
+		if (!state && settings === UNKNOWN_TIMER) return undefined
+		const now = Date.now() + clocks.offset
+		const ms = timerMs(settings, state, now)
+		const finished = timerFinished(settings, state, now)
+		return {
+			id,
+			text: timerText(settings, state, now),
+			seconds: settings.mode === 'countdown' ? Math.ceil(ms / 1000) : Math.floor(ms / 1000),
+			running: timerRunning(settings, state) && !(finished && (settings.end ?? 'stop') === 'stop'),
+			finished,
+		}
+	}
+
+	/** A timer for a feedback: claims the channel, then reads the clocks it has. */
+	timerView(ownerId: string, rawChannel: string | undefined, rawId: string | undefined): TimerView | undefined {
+		const key = this.trackClocks(ownerId, rawChannel)
+		return key ? this.viewTimer(key, rawId) : undefined
+	}
+
+	/** Roll ids a channel shows. */
+	rollIds(channel: string, key?: string): string[] {
+		const ids: string[] = []
+		const comps = channel.startsWith('@')
+			? this.outputCompositions(channel.slice(1)).map((c) => this.compositions.get(c))
+			: [this.compositionFor(channel)]
+		for (const comp of comps) for (const roll of comp?.rolls ?? []) if (!ids.includes(roll.id)) ids.push(roll.id)
+		for (const item of (key ? this.clocks.get(key)?.scrolls?.items : undefined) ?? []) {
+			if (!ids.includes(item.id)) ids.push(item.id)
+		}
+		return ids
+	}
+
+	private viewRoll(key: string, rawId: string | undefined): RollView | undefined {
+		const clocks = this.clocks.get(key)
+		const { channel } = splitKey(key)
+		const id = (rawId ?? '').trim() || this.rollIds(channel, key)[0]
+		if (!id || !clocks) return undefined
+		const item = clocks.scrolls?.items.find((i) => i.id === id)
+		if (!item && !this.rollIds(channel).includes(id)) return undefined
+		const state: ScrollState = item?.state ?? { running: false, anchor: 0, base: 0, rate: 1 }
+		const info: ScrollInfo | undefined = item?.info
+		const now = Date.now() + clocks.offset
+		const atEnd = scrollAtEnd(state, info, now)
+		return {
+			id,
+			percent: scrollPercent(state, info, now),
+			running: state.running && !atEnd,
+			reversed: state.rate < 0,
+			atEnd,
+			speed: speedText(state.rate),
+			remaining: scrollRemaining(state, info, now),
+		}
+	}
+
+	/** A roll for a feedback. */
+	rollView(ownerId: string, rawChannel: string | undefined, rawId: string | undefined): RollView | undefined {
+		const key = this.trackClocks(ownerId, rawChannel)
+		return key ? this.viewRoll(key, rawId) : undefined
+	}
+
+	/**
+	 * Re-check the clock feedbacks when what they show has changed, and keep a
+	 * ticker going while anything shown is running. The ticker writes nothing
+	 * between changes: a 0:42 that is still 0:42 sends no update.
+	 */
+	private onClocksChanged(force = false): void {
+		if (this.destroyed) return
+		let tick = 0
+		const parts: unknown[] = []
+		for (const [key, clocks] of this.clocks) {
+			const { channel } = splitKey(key)
+			for (const id of this.timerIds(channel, key)) {
+				const view = this.viewTimer(key, id)
+				if (!view) continue
+				parts.push([key, 't', id, view.text, view.running, view.finished])
+				if (view.running) {
+					const every = timerTickMs(this.timerSettings(channel, id))
+					tick = tick === 0 ? every : Math.min(tick, every)
+				}
+			}
+			for (const item of clocks.scrolls?.items ?? []) {
+				const view = this.viewRoll(key, item.id)
+				if (!view) continue
+				const left = view.remaining === null ? null : Math.ceil(view.remaining)
+				parts.push([key, 'r', item.id, view.percent, view.running, view.reversed, view.atEnd, view.speed, left])
+				if (view.running) tick = tick === 0 ? 250 : Math.min(tick, 250)
+			}
+		}
+		const playheads = new Set<string>()
+		for (const owner of this.playheadOwners) {
+			const key = this.owners.get(owner)
+			if (key) playheads.add(key)
+		}
+		for (const key of playheads) {
+			const view = this.viewPlayhead(key)
+			if (!view) continue
+			parts.push([key, 'p', view.state, view.time.toFixed(1), view.step, view.stepCount, view.percent])
+			if (view.state === 'playing-in' || view.state === 'playing-out') tick = tick === 0 ? 100 : Math.min(tick, 100)
+		}
+		const signature = JSON.stringify(parts)
+		if (force || signature !== this.clockSignature) {
+			this.clockSignature = signature
+			this.checkFeedbacks(...CLOCK_FEEDBACKS)
+			this.publishTimerVariables()
+		}
+
+		if (tick === 0) {
+			if (this.clockTicker) clearInterval(this.clockTicker)
+			this.clockTicker = undefined
+		} else if (!this.clockTicker) {
+			this.clockTicker = setInterval(() => this.onClocksChanged(), tick)
+		}
+	}
+
+	/** Timer variables follow the default channel's first timer — `main`, if it has one. */
+	private publishTimerVariables(): void {
+		const key = this.defaultKey()
+		const ids = key ? this.timerIds(splitKey(key).channel, key) : []
+		const id = ids.includes('main') ? 'main' : ids[0]
+		const view = key && id ? this.viewTimer(key, id) : undefined
+		const values = view
+			? {
+					timer: view.id,
+					timer_remaining: view.text,
+					timer_seconds: String(view.seconds),
+					timer_running: view.running ? 'true' : 'false',
+				}
+			: EMPTY_TIMER_VARIABLES
+		const shown = JSON.stringify(values)
+		if (shown === this.timerShown) return
+		this.timerShown = shown
+		this.setVariableValues(values)
+	}
+
+	/* -------------------------------------------------------- playhead */
+
+	/**
+	 * A graphic's playhead as the output's debug overlay shows it: state,
+	 * time into the composition, step. Outputs report on change, not every
+	 * frame, so while it plays the time is carried forward from the report by
+	 * the hub's clock and stopped where the runtime would stop: the next STOP
+	 * marker playing in, the end playing out.
+	 */
+	private viewPlayhead(key: string): PlayheadView | undefined {
+		const state = this.states.get(key)
+		if (!state) return undefined
+		const { channel } = splitKey(key)
+		const comp = this.compositionFor(channel)
+		const duration = comp?.duration ?? null
+		const p = state.playback
+		if (!p) return { state: 'idle', time: 0, duration, step: 0, stepCount: 0, percent: 0 }
+		let time = p.time
+		if ((p.state === 'playing-in' || p.state === 'playing-out') && state.reportedAt !== null && state.now !== null) {
+			const since = (state.now - state.reportedAt + Date.now() - (this.receivedAt.get(key) ?? Date.now())) / 1000
+			const stop = p.state === 'playing-in' ? comp?.stops.find((s) => s > p.time + 0.001) : undefined
+			time = Math.min(time + Math.max(0, since), stop ?? duration ?? Infinity)
+		}
+		const percent = duration ? Math.max(0, Math.min(100, Math.round((time / duration) * 100))) : 0
+		return { state: p.state, time, duration, step: p.step, stepCount: p.stepCount, percent }
+	}
+
+	/** A graphic's playhead for a feedback: claims the channel, and keeps it ticking while it plays. */
+	playheadView(ownerId: string, rawChannel: string | undefined): PlayheadView | undefined {
+		const target = this.track(ownerId, rawChannel)
+		if (!target) return undefined
+		this.playheadOwners.add(ownerId)
+		return this.viewPlayhead(`${target.project}/${target.channel}`)
+	}
+
+	/* ------------------------------------------- 0.79: game and poll rows */
+
+	/** Claim a source's rows for a feedback, and return them as last read. */
+	rowsFor(ownerId: string, rawSource: string | undefined): Array<Record<string, unknown>> | undefined {
+		const source = (rawSource ?? '').trim()
+		if (!source) {
+			this.rowOwners.delete(ownerId)
+			return undefined
+		}
+		const previous = this.rowOwners.get(ownerId)
+		this.rowOwners.set(ownerId, source)
+		if (previous !== source && !this.rows.has(source)) void this.pollRows()
+		return this.rows.get(source)
+	}
+
+	/** Rows a press just answered with — buttons read them now, not after the next read. */
+	noteRows(source: string, rows: Array<Record<string, unknown>>): void {
+		this.rows.set(source, rows)
+		this.onRowsChanged()
+	}
+
+	private startRows(): void {
+		this.stopRows()
+		if (this.supports('game') === false && this.supports('polls') === false) return
+		const interval = Math.max(1000, this.config.pollInterval ?? 1000)
+		this.rowsTimer = setInterval(() => void this.pollRows(), interval)
+	}
+
+	private stopRows(): void {
+		if (this.rowsTimer) clearInterval(this.rowsTimer)
+		this.rowsTimer = undefined
+	}
+
+	/**
+	 * Read the rows of every source a button shows, plus the first game table
+	 * (for the score variables). A game table's state is one row and a poll has
+	 * at most twelve, so this stays small; nothing else is read.
+	 */
+	private async pollRows(): Promise<void> {
+		if (this.destroyed || this.rowsInflight) return
+		if (this.supports('game') === false && this.supports('polls') === false) return
+		const project = this.config.project?.trim() ?? ''
+		if (!project) return
+		const wanted = new Set(this.rowOwners.values())
+		const firstGame = this.gameSources()[0]?.def.id
+		if (firstGame) wanted.add(firstGame)
+		for (const id of [...this.rows.keys()]) if (!wanted.has(id)) this.rows.delete(id)
+		if (wanted.size === 0) return
+		const generation = this.generation
+		this.rowsInflight = true
+		try {
+			for (const source of wanted) {
+				try {
+					const rows = await this.api.sourceRows(project, source, ROWS_READ)
+					if (!this.isCurrent(generation)) return
+					this.rows.set(source, rows)
+				} catch {
+					// A deleted source, or the server: the poll and watchdog report that.
+				}
+			}
+			this.onRowsChanged()
+		} finally {
+			this.rowsInflight = false
+		}
+	}
+
+	private onRowsChanged(): void {
+		if (this.destroyed) return
+		const signature = JSON.stringify([...this.rows])
+		if (signature === this.rowsSignature) return
+		this.rowsSignature = signature
+		this.checkFeedbacks(...ROW_FEEDBACKS)
+		const row = this.rows.get(this.gameSources()[0]?.def.id ?? '')?.[0]
+		const values = row
+			? {
+					home_score: cellText(row['homeScore']),
+					away_score: cellText(row['awayScore']),
+					period_label: cellText(row['periodLabel']),
+				}
+			: EMPTY_GAME_VARIABLES
+		const shown = JSON.stringify(values)
+		if (shown === this.gameShown) return
+		this.gameShown = shown
+		this.setVariableValues(values)
 	}
 
 	/* ------------------------------------------------------------ channels */
@@ -969,6 +1778,9 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	/** Companion reported the action or feedback removed, disabled or edited. */
 	untrack(ownerId: string): void {
+		this.clockOwners.delete(ownerId)
+		this.playheadOwners.delete(ownerId)
+		this.rowOwners.delete(ownerId)
 		const previous = this.owners.get(ownerId)
 		if (previous === undefined) return
 		this.owners.delete(ownerId)
@@ -990,6 +1802,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		if (this.isWatched(key)) return
 		this.states.delete(key)
 		this.tableStamps.delete(key)
+		this.clocks.delete(key)
 		this.syncSockets()
 
 		const project = this.config.project?.trim() ?? ''
@@ -1073,6 +1886,34 @@ const EMPTY_TABLE_VARIABLES = {
 	cycle_state: 'none',
 	cycle_seconds_left: '',
 } as const
+
+/** Rundown variables with no rundown to follow. */
+const EMPTY_RUNDOWN_VARIABLES = {
+	rundown: '',
+	cued_item: '',
+	cued_composition: '',
+	cued_position: '',
+	on_air_item: '',
+} as const
+
+/** Timer variables with no timer on the default channel. */
+const EMPTY_TIMER_VARIABLES = {
+	timer: '',
+	timer_remaining: '',
+	timer_seconds: '',
+	timer_running: '',
+} as const
+
+/** Game variables with no game table in the project. */
+const EMPTY_GAME_VARIABLES = {
+	home_score: '',
+	away_score: '',
+	period_label: '',
+} as const
+
+function messageOf(error: unknown): string {
+	return error instanceof Error ? error.message : String(error)
+}
 
 /** Split a `project/channel` key. Project keys cannot contain `/`, so the first one is the seam. */
 function splitKey(key: string): Target {

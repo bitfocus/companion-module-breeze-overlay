@@ -17,6 +17,13 @@ import type ModuleInstance from './main.js'
  * table on the default channel, rather than one set per table whose names
  * would come and go with the composition. A specific table is what the
  * feedbacks' Table field is for.
+ *
+ * And the 0.79 additions: the rundown variables follow the project's first
+ * rundown, the timer variables the default channel's `main` timer (or its
+ * first), and the score variables the project's first sport game table. Any
+ * other rundown, timer, roll, game or poll is shown through a value feedback
+ * into a button's local variable, as the presets do — never through a variable
+ * named after something an editor can rename or delete.
  */
 export type VariablesSchema = {
 	server_version: string
@@ -46,6 +53,24 @@ export type VariablesSchema = {
 	media_up: string
 	/** Cameras failed or frozen across the project's camera lists (Wave 8). */
 	media_down: string
+	/** The first rundown's name (0.79+). */
+	rundown: string
+	/** The armed item's title, as the rundown panel shows it. */
+	cued_item: string
+	cued_composition: string
+	/** `3/15`. */
+	cued_position: string
+	/** What the armed item's target shows now. */
+	on_air_item: string
+	/** The default channel's timer: its id, its text, whole seconds, `true`/`false`. */
+	timer: string
+	timer_remaining: string
+	timer_seconds: string
+	timer_running: string
+	/** The first sport game table's score and period. */
+	home_score: string
+	away_score: string
+	period_label: string
 }
 
 export function UpdateVariableDefinitions(self: ModuleInstance): void {
@@ -70,5 +95,17 @@ export function UpdateVariableDefinitions(self: ModuleInstance): void {
 		mode: { name: 'The project mode — blank for none (Breeze 0.74+)' },
 		media_up: { name: 'Cameras up across the project’s camera lists (Breeze 0.74+)' },
 		media_down: { name: 'Cameras failed or frozen across the project’s camera lists (Breeze 0.74+)' },
+		rundown: { name: 'The first rundown’s name (Breeze 0.79+)' },
+		cued_item: { name: 'The item armed in that rundown — what TAKE puts on air next' },
+		cued_composition: { name: 'The graphic of the armed item' },
+		cued_position: { name: 'The armed item’s place in the rundown — e.g. 3/15' },
+		on_air_item: { name: 'The item on air where the armed item goes' },
+		timer: { name: 'The default channel’s timer id — main, or its first (Breeze 0.79+)' },
+		timer_remaining: { name: 'That timer as the graphic shows it — e.g. 7:42' },
+		timer_seconds: { name: 'That timer in whole seconds' },
+		timer_running: { name: 'Whether that timer is running — true or false' },
+		home_score: { name: 'Home score of the project’s first sport game table (Breeze 0.79+)' },
+		away_score: { name: 'Away score of that game table' },
+		period_label: { name: 'Period of that game table — e.g. 3rd, 2OT, Top 7th' },
 	})
 }

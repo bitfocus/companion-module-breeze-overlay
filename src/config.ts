@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Dave Clark
 // SPDX-License-Identifier: MIT
 
-import { Regex, type SomeCompanionConfigField } from '@companion-module/base'
+import type { SomeCompanionConfigField } from '@companion-module/base'
 
 export type ModuleConfig = {
 	host: string
@@ -39,9 +39,9 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			label: 'Server address',
 			width: 8,
 			default: '127.0.0.1',
-			// Not `Regex.IP`: a hostname is at least as common as an address on a
-			// gallery LAN, and rejecting `graphics-pc` would be wrong.
-			regex: Regex.SOMETHING,
+			// No regex: a hostname is at least as common as an address on a gallery
+			// LAN, and rejecting `graphics-pc` would be wrong. Required, though.
+			minLength: 1,
 		},
 		{
 			type: 'number',

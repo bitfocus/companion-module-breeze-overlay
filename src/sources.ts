@@ -19,15 +19,26 @@ import type { SourceSummary } from './api.js'
  * - `waiting` — has not fetched yet
  * - `live` — working
  *
- * A manual source is always `live`: its rows are typed, not fetched.
+ * A source held in the project (manual, poll, a text with no URL) is always
+ * `live`: its rows are typed, not fetched.
  */
 export function sourceState(source: SourceSummary): string {
 	const status = source.status
 	if (status.serving !== undefined) return 'backup'
 	if (status.expired || status.stuck) return 'expired'
 	if ((status.failures ?? 0) > 0) return 'failing'
-	if (source.def.type !== 'manual' && !status.lastSuccess) return 'waiting'
+	if (!isInline(source) && !status.lastSuccess) return 'waiting'
 	return 'live'
+}
+
+/**
+ * A source whose rows are held in the project rather than fetched: manual
+ * tables, polls (0.79+), and a text source with no URL (0.79+). It never has a
+ * fetch to wait for, so it is never `waiting`.
+ */
+export function isInline(source: SourceSummary): boolean {
+	const type = source.def.type
+	return type === 'manual' || type === 'poll' || (type === 'text' && source.def.url === undefined)
 }
 
 /** Cameras in a source that are down — failed or frozen — or null for a source with no media checks. */

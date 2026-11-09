@@ -65,6 +65,13 @@ export class LiveChannel {
 		/** `project/channel` — the hub's own channel name. */
 		readonly key: string,
 		private readonly events: LiveChannelEvents,
+		/**
+		 * Ask for the channel's field data too. Only for a channel that carries
+		 * little — the rundown channel (`project/#rundowns`, 0.79+), whose data is
+		 * just what is armed and on air. A graphic's data holds every source's
+		 * rows, which is why the default leaves it out.
+		 */
+		private readonly withData = false,
 	) {}
 
 	start(): void {
@@ -137,7 +144,7 @@ export class LiveChannel {
 					channel: this.key,
 					role: 'controller',
 					client: 'companion',
-					data: false,
+					...(this.withData ? {} : { data: false }),
 				}),
 			)
 		}

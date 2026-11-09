@@ -3,6 +3,8 @@
 
 import { combineRgb } from '@companion-module/base'
 import type ModuleInstance from './main.js'
+import { cellText } from './catalogue.js'
+import { formatMs } from './clocks.js'
 import { mediaDown, overridden, sourceState } from './sources.js'
 import { findTable, pageText, showsPage } from './tables.js'
 
@@ -12,10 +14,42 @@ export type FeedbacksSchema = {
 	source_connected: { type: 'boolean'; options: { channel: string } }
 	cycle_held: { type: 'boolean'; options: { channel: string; table: string } }
 	page_is: { type: 'boolean'; options: { channel: string; table: string; by: string; page: string } }
-	table_page: { type: 'value'; options: { channel: string; table: string; show: string } }
+	table_page: { type: 'value'; options: { channel: string; table: string; show: string }; result: string }
 	source_state: { type: 'boolean'; options: { source: string; state: string } }
 	media_state: { type: 'boolean'; options: { source: string; state: string } }
 	mode_is: { type: 'boolean'; options: { mode: string } }
+	rundown_item: { type: 'boolean'; options: { rundown: string; item: string; state: string } }
+	rundown_cued_differs: { type: 'boolean'; options: { rundown: string } }
+	rundown_value: { type: 'value'; options: { rundown: string; show: string }; result: string }
+	timer_running: { type: 'boolean'; options: { channel: string; timer: string } }
+	timer_under: { type: 'boolean'; options: { channel: string; timer: string; seconds: number } }
+	timer_value: { type: 'value'; options: { channel: string; timer: string; show: string }; result: string }
+	roll_is: { type: 'boolean'; options: { channel: string; roll: string; state: string } }
+	roll_value: { type: 'value'; options: { channel: string; roll: string; show: string }; result: string | number }
+	playhead_value: { type: 'value'; options: { channel: string; show: string }; result: string | number }
+	playback_color: {
+		type: 'value'
+		options: { channel: string; idle: number; playingIn: number; holding: number; playingOut: number }
+		result: number
+	}
+	roll_color: {
+		type: 'value'
+		options: {
+			channel: string
+			roll: string
+			warn: number
+			critical: number
+			normal: number
+			warnColor: number
+			criticalColor: number
+		}
+		result: number
+	}
+	game_value: { type: 'value'; options: { source: string; column: string }; result: string }
+	game_column_is: { type: 'boolean'; options: { source: string; column: string; value: string } }
+	poll_value: { type: 'value'; options: { source: string; option: string; show: string }; result: string }
+	poll_open: { type: 'boolean'; options: { source: string } }
+	poll_leading: { type: 'boolean'; options: { source: string; option: string } }
 }
 
 /**
@@ -50,6 +84,39 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 	 * feedback's channel stops being polled.
 	 */
 	const unsubscribe = (feedback: { id: string }) => self.untrack(`feedback:${feedback.id}`)
+
+	const clockChannelOption = {
+		...channelOption,
+		label: 'Channel — a graphic, or @output (blank = connection default)',
+	}
+	const timerOption = {
+		id: 'timer' as const,
+		type: 'textinput' as const,
+		label: 'Timer id (blank = the channel’s first, main if it has one)',
+		default: '',
+		useVariables: true,
+	}
+	const rollOption = {
+		id: 'roll' as const,
+		type: 'textinput' as const,
+		label: 'Roll id (blank = the channel’s first)',
+		default: '',
+		useVariables: true,
+	}
+	const rundownOption = {
+		id: 'rundown' as const,
+		type: 'textinput' as const,
+		label: 'Rundown id (blank = the first rundown)',
+		default: '',
+		useVariables: true,
+	}
+	const sourceOption = {
+		id: 'source' as const,
+		type: 'textinput' as const,
+		label: 'Data source id',
+		default: '',
+		useVariables: true,
+	}
 
 	self.setFeedbackDefinitions({
 		/**
@@ -346,6 +413,493 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 				const current = self.currentMode()
 				if (current === undefined) return false
 				return current.toLowerCase() === (feedback.options.mode ?? '').trim().toLowerCase()
+			},
+		},
+
+		/* ------------------------------------------------ 0.79: rundowns */
+
+		/**
+		 * An item is armed, or on air. For a bank of Arm buttons: the armed one
+		 * lights amber, and the one on air red.
+		 */
+		rundown_item: {
+			name: 'Rundown item is armed or on air (Breeze 0.79+)',
+			type: 'boolean',
+			defaultStyle: { bgcolor: combineRgb(200, 120, 0), color: combineRgb(0, 0, 0) },
+			options: [
+				rundownOption,
+				{ id: 'item', type: 'textinput', label: 'Item id', default: '', useVariables: true },
+				{
+					id: 'state',
+					type: 'dropdown',
+					label: 'State',
+					default: 'armed',
+					choices: [
+						{ id: 'armed', label: 'Armed — TAKE puts it on air next' },
+						{ id: 'on_air', label: 'On air' },
+					],
+					disableAutoExpression: true,
+				},
+			],
+			callback: (feedback) => {
+				const rundown = self.rundownFor(feedback.options.rundown)
+				const live = rundown ? self.rundownState(rundown.id) : undefined
+				const item = (feedback.options.item ?? '').trim()
+				if (!live || !item) return false
+				if (feedback.options.state === 'on_air') return Object.values(live.onAir).includes(item)
+				return live.armed === item
+			},
+		},
+
+		/**
+		 * The armed item is not what its target shows — the moment before a
+		 * TAKE. Off once it is taken, or when nothing is armed.
+		 */
+		rundown_cued_differs: {
+			name: 'Rundown: armed item is not on air yet (Breeze 0.79+)',
+			type: 'boolean',
+			defaultStyle: { bgcolor: combineRgb(200, 120, 0), color: combineRgb(0, 0, 0) },
+			options: [rundownOption],
+			callback: (feedback) => {
+				const rundown = self.rundownFor(feedback.options.rundown)
+				const live = rundown ? self.rundownState(rundown.id) : undefined
+				const armed = rundown?.items.find((i) => i.id === live?.armed)
+				if (!live || !armed) return false
+				return live.onAir[armed.output ? `@${armed.output}` : armed.composition] !== armed.id
+			},
+		},
+
+		/** What a TAKE button prints: the armed item, its graphic, its place, or what is on air. */
+		rundown_value: {
+			name: 'Rundown — armed item, its place, or what is on air (Breeze 0.79+)',
+			type: 'value',
+			options: [
+				rundownOption,
+				{
+					id: 'show',
+					type: 'dropdown',
+					label: 'Show',
+					default: 'cued',
+					choices: [
+						{ id: 'cued', label: 'Armed item' },
+						{ id: 'composition', label: 'Armed item’s graphic' },
+						{ id: 'position', label: 'Armed item’s place — 3/15' },
+						{ id: 'on_air', label: 'On air where the armed item goes' },
+						{ id: 'name', label: 'Rundown name' },
+					],
+					disableAutoExpression: true,
+				},
+			],
+			callback: (feedback) => {
+				const rundown = self.rundownFor(feedback.options.rundown)
+				if (!rundown) return ''
+				if (feedback.options.show === 'name') return rundown.name
+				const live = self.rundownState(rundown.id)
+				const armed = rundown.items.find((i) => i.id === live?.armed)
+				switch (feedback.options.show) {
+					case 'composition':
+						return armed ? (self.compositionFor(armed.composition)?.name ?? armed.composition) : ''
+					case 'position':
+						return armed ? `${rundown.items.indexOf(armed) + 1}/${rundown.items.length}` : ''
+					case 'on_air': {
+						const target = armed ? (armed.output ? `@${armed.output}` : armed.composition) : undefined
+						const id = live ? (target ? live.onAir[target] : Object.values(live.onAir).at(-1)) : undefined
+						return self.itemTitle(rundown.items.find((i) => i.id === id))
+					}
+					default:
+						return self.itemTitle(armed)
+				}
+			},
+		},
+
+		/* ----------------------------------------- 0.79: timers and rolls */
+
+		timer_running: {
+			name: 'Timer is running (Breeze 0.79+)',
+			type: 'boolean',
+			defaultStyle: { bgcolor: combineRgb(0, 120, 40), color: combineRgb(255, 255, 255) },
+			options: [clockChannelOption, timerOption],
+			unsubscribe,
+			callback: (feedback) =>
+				self.timerView(`feedback:${feedback.id}`, feedback.options.channel, feedback.options.timer)?.running === true,
+		},
+
+		/** The last thirty seconds — or the last N — of a countdown, or N into a count-up. */
+		timer_under: {
+			name: 'Timer at or under N seconds (Breeze 0.79+)',
+			type: 'boolean',
+			defaultStyle: { bgcolor: combineRgb(200, 0, 0), color: combineRgb(255, 255, 255) },
+			options: [
+				clockChannelOption,
+				timerOption,
+				{ id: 'seconds', type: 'number', label: 'Seconds', default: 30, min: 0, max: 86400 },
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const view = self.timerView(`feedback:${feedback.id}`, feedback.options.channel, feedback.options.timer)
+				return view !== undefined && view.seconds <= Number(feedback.options.seconds ?? 30)
+			},
+		},
+
+		/** What a timer button prints — the clock as the graphic shows it. */
+		timer_value: {
+			name: 'Timer — as shown, in seconds, or running (Breeze 0.79+)',
+			type: 'value',
+			options: [
+				clockChannelOption,
+				timerOption,
+				{
+					id: 'show',
+					type: 'dropdown',
+					label: 'Show',
+					default: 'text',
+					choices: [
+						{ id: 'text', label: 'As the graphic shows it — 7:42' },
+						{ id: 'seconds', label: 'Whole seconds — 462' },
+						{ id: 'running', label: 'Running — true or false' },
+					],
+					disableAutoExpression: true,
+				},
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const view = self.timerView(`feedback:${feedback.id}`, feedback.options.channel, feedback.options.timer)
+				if (!view) return ''
+				if (feedback.options.show === 'seconds') return String(view.seconds)
+				if (feedback.options.show === 'running') return view.running ? 'true' : 'false'
+				return view.text
+			},
+		},
+
+		roll_is: {
+			name: 'Roll is running, reversed or at its end (Breeze 0.79+)',
+			type: 'boolean',
+			defaultStyle: { bgcolor: combineRgb(0, 120, 40), color: combineRgb(255, 255, 255) },
+			options: [
+				clockChannelOption,
+				rollOption,
+				{
+					id: 'state',
+					type: 'dropdown',
+					label: 'State',
+					default: 'running',
+					choices: [
+						{ id: 'running', label: 'Running' },
+						{ id: 'reversed', label: 'Running backward' },
+						{ id: 'at_end', label: 'At its end' },
+					],
+					disableAutoExpression: true,
+				},
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const view = self.rollView(`feedback:${feedback.id}`, feedback.options.channel, feedback.options.roll)
+				if (!view) return false
+				if (feedback.options.state === 'reversed') return view.reversed
+				if (feedback.options.state === 'at_end') return view.atEnd
+				return view.running
+			},
+		},
+
+		roll_value: {
+			name: 'Roll — how far, speed or direction (Breeze 0.79+)',
+			type: 'value',
+			options: [
+				clockChannelOption,
+				rollOption,
+				{
+					id: 'show',
+					type: 'dropdown',
+					label: 'Show',
+					default: 'percent',
+					choices: [
+						{ id: 'percent', label: 'How far through — 42%' },
+						{ id: 'percent_number', label: 'How far through, as a number 0–100 — for a gauge' },
+						{ id: 'remaining', label: 'Time left at this speed — 1:42' },
+						{ id: 'remaining_seconds', label: 'Time left in whole seconds' },
+						{ id: 'speed', label: 'Speed — ×1.25' },
+						{ id: 'direction', label: 'Direction — forward or backward' },
+						{ id: 'state', label: 'State — running, paused or end' },
+					],
+					disableAutoExpression: true,
+				},
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const view = self.rollView(`feedback:${feedback.id}`, feedback.options.channel, feedback.options.roll)
+				if (!view) return ''
+				switch (feedback.options.show) {
+					case 'percent_number':
+						return view.percent ?? 0
+					case 'remaining':
+						return view.remaining === null ? '' : formatMs(view.remaining * 1000, 'm:ss', true)
+					case 'remaining_seconds':
+						return view.remaining === null ? '' : String(Math.ceil(view.remaining))
+					case 'speed':
+						return view.speed
+					case 'direction':
+						return view.reversed ? 'backward' : 'forward'
+					case 'state':
+						return view.atEnd ? 'end' : view.running ? 'running' : 'paused'
+					default:
+						return view.percent === null ? '' : `${view.percent}%`
+				}
+			},
+		},
+
+		/**
+		 * The output page's debug line, for a button: state, the time into the
+		 * composition over its length, and the step — or any one of them. The
+		 * time is carried forward between reports while the graphic plays.
+		 */
+		playhead_value: {
+			name: 'Playhead — state, time and step, as the debug view shows them',
+			type: 'value',
+			options: [
+				channelOption,
+				{
+					id: 'show',
+					type: 'dropdown',
+					label: 'Show',
+					default: 'line',
+					choices: [
+						{ id: 'line', label: 'The debug line — holding t=1.50/2.40s step 1/1' },
+						{ id: 'state', label: 'State — idle, playing-in, holding, playing-out, finished' },
+						{ id: 'time', label: 'Time — t=1.50/2.40s' },
+						{ id: 'seconds', label: 'Time in seconds — 1.50' },
+						{ id: 'percent_number', label: 'How far through, as a number 0–100 — for a gauge' },
+						{ id: 'step', label: 'Step — 1/1' },
+						{ id: 'step_line', label: 'Step with its word — step 1/1' },
+						{ id: 'duration', label: 'Length in seconds — 2.40' },
+					],
+					disableAutoExpression: true,
+				},
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const view = self.playheadView(`feedback:${feedback.id}`, feedback.options.channel)
+				if (!view) return feedback.options.show === 'percent_number' ? 0 : ''
+				const time = `t=${view.time.toFixed(2)}${view.duration !== null ? `/${view.duration.toFixed(2)}` : ''}s`
+				const step = `${view.step}/${view.stepCount}`
+				switch (feedback.options.show) {
+					case 'state':
+						return view.state
+					case 'time':
+						return time
+					case 'seconds':
+						return view.time.toFixed(2)
+					case 'percent_number':
+						return view.percent
+					case 'step':
+						return step
+					case 'step_line':
+						return `step ${step}`
+					case 'duration':
+						return view.duration === null ? '' : view.duration.toFixed(2)
+					default:
+						return `${view.state} ${time} step ${step}`
+				}
+			},
+		},
+
+		/** A colour for a playhead ring: grey idle, green playing in, red holding (on air), amber playing out. */
+		playback_color: {
+			name: 'Playback — colour by state',
+			type: 'value',
+			options: [
+				channelOption,
+				{
+					id: 'idle',
+					type: 'colorpicker',
+					label: 'Idle or finished',
+					default: combineRgb(90, 90, 90),
+					returnType: 'number',
+				},
+				{
+					id: 'playingIn',
+					type: 'colorpicker',
+					label: 'Playing in',
+					default: combineRgb(0, 200, 80),
+					returnType: 'number',
+				},
+				{
+					id: 'holding',
+					type: 'colorpicker',
+					label: 'Holding (on air)',
+					default: combineRgb(230, 0, 0),
+					returnType: 'number',
+				},
+				{
+					id: 'playingOut',
+					type: 'colorpicker',
+					label: 'Playing out',
+					default: combineRgb(255, 200, 0),
+					returnType: 'number',
+				},
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const o = feedback.options
+				switch (self.playheadView(`feedback:${feedback.id}`, o.channel)?.state) {
+					case 'playing-in':
+						return Number(o.playingIn)
+					case 'holding':
+						return Number(o.holding)
+					case 'playing-out':
+						return Number(o.playingOut)
+					default:
+						return Number(o.idle)
+				}
+			},
+		},
+
+		/**
+		 * A colour for a roll's progress ring: normal, then a warning colour and
+		 * a last-seconds colour as the time left at the current speed runs down
+		 * — green, yellow under 30 s, red under 10 s by default. A loop, which
+		 * never ends, stays the normal colour.
+		 */
+		roll_color: {
+			name: 'Roll — colour by time left (Breeze 0.79+)',
+			type: 'value',
+			options: [
+				clockChannelOption,
+				rollOption,
+				{ id: 'warn', type: 'number', label: 'Warning at (seconds left)', default: 30, min: 0, max: 3600 },
+				{ id: 'critical', type: 'number', label: 'Last seconds at (seconds left)', default: 10, min: 0, max: 3600 },
+				{ id: 'normal', type: 'colorpicker', label: 'Normal', default: combineRgb(0, 200, 80), returnType: 'number' },
+				{
+					id: 'warnColor',
+					type: 'colorpicker',
+					label: 'Warning',
+					default: combineRgb(255, 200, 0),
+					returnType: 'number',
+				},
+				{
+					id: 'criticalColor',
+					type: 'colorpicker',
+					label: 'Last seconds',
+					default: combineRgb(230, 0, 0),
+					returnType: 'number',
+				},
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const o = feedback.options
+				const view = self.rollView(`feedback:${feedback.id}`, o.channel, o.roll)
+				const left = view?.remaining
+				if (left === null || left === undefined) return Number(o.normal)
+				if (left <= Number(o.critical)) return Number(o.criticalColor)
+				if (left <= Number(o.warn)) return Number(o.warnColor)
+				return Number(o.normal)
+			},
+		},
+
+		/* --------------------------------------- 0.79: games and polls */
+
+		/** One column of a game table — `homeScore`, `periodLabel`, `homeFouls`. */
+		game_value: {
+			name: 'Game — a column of a sport game table (Breeze 0.79+)',
+			type: 'value',
+			options: [
+				sourceOption,
+				{ id: 'column', type: 'textinput', label: 'Column', default: 'homeScore', useVariables: true },
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const row = self.rowsFor(`feedback:${feedback.id}`, feedback.options.source)?.[0]
+				return row ? cellText(row[(feedback.options.column ?? '').trim()]) : ''
+			},
+		},
+
+		/** For possession, serving or a status: lit while a column holds a value. */
+		game_column_is: {
+			name: 'Game column is… — possession, serving, status (Breeze 0.79+)',
+			type: 'boolean',
+			defaultStyle: { bgcolor: combineRgb(200, 120, 0), color: combineRgb(0, 0, 0) },
+			options: [
+				sourceOption,
+				{ id: 'column', type: 'textinput', label: 'Column', default: 'possession', useVariables: true },
+				{ id: 'value', type: 'textinput', label: 'Value', default: 'home', useVariables: true },
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const row = self.rowsFor(`feedback:${feedback.id}`, feedback.options.source)?.[0]
+				if (!row) return false
+				const value = cellText(row[(feedback.options.column ?? '').trim()])
+				return value.toLowerCase() === (feedback.options.value ?? '').trim().toLowerCase()
+			},
+		},
+
+		/** What a poll button prints: an option's votes or share, or the poll's question, total or status. */
+		poll_value: {
+			name: 'Poll — votes, percent, question or total (Breeze 0.79+)',
+			type: 'value',
+			options: [
+				sourceOption,
+				{
+					id: 'option',
+					type: 'textinput',
+					label: 'Option id (for votes, percent, label and rank)',
+					default: '',
+					useVariables: true,
+				},
+				{
+					id: 'show',
+					type: 'dropdown',
+					label: 'Show',
+					default: 'votes',
+					choices: [
+						{ id: 'votes', label: 'Option’s votes' },
+						{ id: 'percent', label: 'Option’s percent — 42%' },
+						{ id: 'label', label: 'Option’s label' },
+						{ id: 'rank', label: 'Option’s rank' },
+						{ id: 'leader', label: 'The leading option’s label' },
+						{ id: 'question', label: 'Question' },
+						{ id: 'total', label: 'Total votes' },
+						{ id: 'status', label: 'Open or closed' },
+					],
+					disableAutoExpression: true,
+				},
+			],
+			unsubscribe,
+			callback: (feedback) => {
+				const rows = self.rowsFor(`feedback:${feedback.id}`, feedback.options.source)
+				if (!rows || rows.length === 0) return ''
+				const show = feedback.options.show
+				if (show === 'question' || show === 'total' || show === 'status') return cellText(rows[0][show])
+				if (show === 'leader') {
+					const leaders = rows.filter((r) => r['leader'] === true)
+					return leaders.map((r) => cellText(r['label'])).join(' / ')
+				}
+				const row = rows.find((r) => r['option'] === (feedback.options.option ?? '').trim())
+				if (!row) return ''
+				if (show === 'percent') return row['percent'] === null ? '' : `${cellText(row['percent'])}%`
+				return cellText(row[show === 'label' || show === 'rank' ? show : 'votes'])
+			},
+		},
+
+		poll_open: {
+			name: 'Poll is open (Breeze 0.79+)',
+			type: 'boolean',
+			defaultStyle: { bgcolor: combineRgb(0, 120, 40), color: combineRgb(255, 255, 255) },
+			options: [sourceOption],
+			unsubscribe,
+			callback: (feedback) =>
+				self.rowsFor(`feedback:${feedback.id}`, feedback.options.source)?.[0]?.['status'] === 'open',
+		},
+
+		/** An option is leading, or tied for the lead. */
+		poll_leading: {
+			name: 'Poll option is leading (Breeze 0.79+)',
+			type: 'boolean',
+			defaultStyle: { bgcolor: combineRgb(200, 120, 0), color: combineRgb(0, 0, 0) },
+			options: [sourceOption, { id: 'option', type: 'textinput', label: 'Option id', default: '', useVariables: true }],
+			unsubscribe,
+			callback: (feedback) => {
+				const rows = self.rowsFor(`feedback:${feedback.id}`, feedback.options.source)
+				const row = rows?.find((r) => r['option'] === (feedback.options.option ?? '').trim())
+				return row?.['leader'] === true
 			},
 		},
 	})

@@ -13,12 +13,15 @@ the connection's Help button.
 
 ## Requirements
 
-- Companion 5.0 or newer (`@companion-module/base` v2 API)
-- A reachable Breeze Overlay server, v0.64.0 or newer for preset generation
+- Companion 5.1 or newer (`@companion-module/base` 2.2, module API 2.2). On
+  Companion 5.0, use module 1.1.x
+- A reachable Breeze Overlay server: v0.64.0 or newer for preset generation, v0.74.0
+  for live state, v0.79.0 for rundowns, outputs, timers, game tables, typed fields,
+  rolls and polls
 
 ## Development
 
-Node 22 and Yarn 4. Yarn comes from Corepack, which ships with Node — if `yarn`
+Node 26 and Yarn 4. Yarn comes from Corepack, which ships with Node — if `yarn`
 is not found, run `corepack enable` once.
 
 ```sh

@@ -4,7 +4,38 @@ All notable changes to the Breeze Overlay module for Bitfocus Companion are docu
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each release is tagged `vX.Y.Z` and submitted through the Bitfocus developer portal. Features marked **0.74+** need Breeze Overlay 0.74.0 or later; against an older server they log _"needs Breeze 0.74 or later"_ and send nothing.
 
-## [1.1.1]
+## [1.2.0]
+
+> Rundowns, outputs, timers, sport game tables, typed fields, rolls and polls, for Breeze Overlay 0.79.
+
+**Needs Companion 5.1 or later.** The module now uses Companion's module API 2.2 (`@companion-module/base` 2.2.2), which Companion 5.0 does not load. On Companion 5.0, stay on 1.1.1. Features marked **0.79+** need Breeze Overlay 0.79.0 or later; against an older server they log _"needs Breeze 0.79.0 or later"_ and send nothing, and their presets are not offered.
+
+### Added
+
+- **Rundown** actions (**0.79+**): **TAKE** the armed item (or a given one) and arm the next, **arm** the next, previous or a given item, and **take a target off air**.
+- **Rundown item is armed or on air**, **Rundown: armed item is not on air yet** and **Rundown** value feedbacks, and variables `rundown`, `cued_item`, `cued_composition`, `cued_position` and `on_air_item` for the project's first rundown. Armed and on-air state arrives live from the server.
+- A preset section per rundown: TAKE showing the armed item, ARM NEXT, ARM PREV, OUT, and an Arm button per item, lit amber while armed and red while on air. Rebuilt when the rundown is saved in Breeze.
+- **Output** action (**0.79+**): STOP, NEXT, PREV or CLEAR on an output, for one graphic on it or all, with an _Output @name_ preset section per output the rundowns use.
+- **Timer** action (**0.79+**): start/pause, start, pause, reset, set or add, on a graphic's timers or an output's (`@main`).
+- **Timer is running**, **Timer at or under N seconds** and **Timer** value feedbacks, and variables `timer`, `timer_remaining`, `timer_seconds` and `timer_running` for the default channel. The clock is worked out on the Companion side from the server's state, in the graphic's own format, so it counts without polling.
+- Timer presets for every timer a graphic shows: START/PAUSE showing the clock, RESET, +10, −10, +1, −1.
+- **Roll** action (**0.79+**): the roll transport — play/pause, forward, backward, reverse, faster, slower, speed, jog, go to, restart, end and reset — with **Roll is…** and **Roll** value feedbacks and a transport row of presets per roll.
+- A **DEBUG** status preset for every graphic: the output page's debug view on a button, with a ring for the playhead coloured by playback state, and the state, time and step inside. The new **Playhead** and **Playback — colour by state** value feedbacks drive it; the time is carried forward between output reports while the graphic plays. Works on any Breeze version.
+- A **PROGRESS** preset per roll: a ring that fills in step with the control panel's position bar, with the time left in the middle, turning from green to yellow with 30 s left and to red with 10 s. The **Roll — colour by time left** value feedback sets the colours and the seconds, and the **Roll** feedback can show the time left and a number for a gauge.
+- **Game** action (**0.79+**): scoring actions, points, the period, and adding to or setting any column of a sport game table, with **Game** value and **Game column is…** feedbacks, variables `home_score`, `away_score` and `period_label`, and a preset section per game table laid out for its sport.
+- **Poll** action (**0.79+**): vote, set a count, open, close, toggle and reset, with **Poll** value, **Poll is open** and **Poll option is leading** feedbacks and a preset section per poll.
+- **Field** action (**0.79+** for typed fields): set a field, add to a number within its min and max, toggle an on/off field or switch it on or off, with presets for every typed field a graphic declares.
+
+### Changed
+
+- Built on `@companion-module/base` 2.2.2 (module API 2.2), so it needs Companion 5.1 or later.
+- The server address field is required with `minLength` instead of the deprecated `Regex.SOMETHING`. It accepts exactly what it did before.
+
+### Fixed
+
+- **Data source is… Live** is now true for a poll or a text source held in the project. These sources never fetch, and 1.1.1 read them as still waiting for their first fetch.
+
+## [1.1.1] - 2026-10-30
 
 ### Added
 
@@ -72,6 +103,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Presets for every graphic in the project, grouped by graphic.
 - Separate **Connection failure** and **Authentication failure** statuses, and log warnings when a call reaches no browser source, names an unknown channel or has its API key rejected.
 
+[1.2.0]: https://github.com/bitfocus/companion-module-breeze-overlay/compare/v1.1.1...v1.2.0
+[1.1.1]: https://github.com/bitfocus/companion-module-breeze-overlay/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/bitfocus/companion-module-breeze-overlay/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bitfocus/companion-module-breeze-overlay/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bitfocus/companion-module-breeze-overlay/releases/tag/v1.0.0
